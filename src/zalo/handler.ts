@@ -10,7 +10,7 @@ import { tgBot } from '../telegram/bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyMentionsHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
-import { msgStore, userCache, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, type ZaloQuoteData } from '../store.js';
 
 // ── Bank card HTML parser ────────────────────────────────────────────────────
 interface BankCardInfo {
@@ -137,6 +137,21 @@ function parseContent(raw: string | ZaloMediaContent | Record<string, unknown>):
   return { text: null, media: raw as ZaloMediaContent };
 }
 
+// ── Poll helpers ─────────────────────────────────────────────────────────────
+
+import type { PollOptions } from 'zca-js';
+
+function buildScoreText(header: string, options: Pick<PollOptions, 'content' | 'votes'>[], closed: boolean): string {
+  const total = options.reduce((s, o) => s + (o.votes ?? 0), 0);
+  const lines = options.map(o => {
+    const pct = total > 0 ? Math.round((o.votes / total) * 100) : 0;
+    const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
+    return `${escapeHtml(o.content)}\n  ${bar} ${o.votes} phiếu (${pct}%)`;
+  });
+  const status = closed ? ' <i>[Đã đóng]</i>' : '';
+  return `📊 <b>${escapeHtml(header)}</b>${status}\n\nTổng: ${total} phiếu\n\n${lines.join('\n\n')}`;
+}
+
 // ── Main handler ─────────────────────────────────────────────────────────────
 
 /** Track which groups already had their member cache populated this session. */
@@ -259,7 +274,20 @@ export function setupZaloHandler(api: ZaloAPI): void {
         return;
       }
 
-      // ── 3. GIF ─────────────────────────────────────────────────────────────
+      // ── 2b. Doodle (sketch/drawing) ────────────────────────────────────────
+      if (msgType === ZALO_MSG_TYPES.DOODLE) {
+        const url = media.href || media.thumb;
+        if (!url) { console.warn('[ZaloHandler] Doodle: no URL'); return; }
+        const localPath = await downloadToTemp(url, `doodle_${Date.now()}.jpg`);
+        const stream = createReadStream(localPath);
+        try {
+          const sent = await tgBot.telegram.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
+          saveTgMapping(sent);
+        } finally { await cleanTemp(localPath); }
+        return;
+      }
+
+
       if (msgType === ZALO_MSG_TYPES.GIF) {
         const url = media.href;
         if (!url) {
@@ -448,6 +476,181 @@ export function setupZaloHandler(api: ZaloAPI): void {
         return;
       }
 
+      // ── 10. Location ───────────────────────────────────────────────────────
+      if (msgType === ZALO_MSG_TYPES.LOCATION) {
+        let lat: number | undefined;
+        let lng: number | undefined;
+        try {
+          const p = JSON.parse(media.params ?? '{}') as { latitude?: number; longitude?: number };
+          lat = p.latitude;
+          lng = p.longitude;
+        } catch { /* ignore */ }
+
+        if (lat !== undefined && lng !== undefined) {
+          // Send as native TG location — shows map preview with Maps button
+          const sent = await tgBot.telegram.sendLocation(
+            config.telegram.groupId,
+            lat,
+            lng,
+            { ...tgBase } as Parameters<typeof tgBot.telegram.sendLocation>[3],
+          );
+          if (type === ThreadType.Group) {
+            // Send sender name as a follow-up caption since sendLocation has no HTML caption
+            await tgBot.telegram.sendMessage(
+              config.telegram.groupId,
+              `${groupCaption(senderName)}📍 Vị trí`,
+              { ...tgBase, parse_mode: 'HTML' },
+            );
+          }
+          saveTgMapping(sent);
+        } else {
+          // Fallback: Google Maps link
+          const mapsUrl = media.href || '#';
+          const body    = `📍 <a href="${mapsUrl}">Vị trí</a>`;
+          const text    = type === ThreadType.Group ? `${groupCaption(senderName)}\n${body}` : body;
+          const sent    = await tgBot.telegram.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
+          saveTgMapping(sent);
+        }
+        return;
+      }
+
+      // ── 11. Poll ────────────────────────────────────────────────────────────
+      if (msgType === ZALO_MSG_TYPES.POLL) {
+        let pollId: number | undefined;
+        let question = '';
+        let isAnonymous = false;
+        let action = '';
+        try {
+          const p = JSON.parse(media.params ?? '{}') as {
+            pollId?: number;
+            question?: string;
+            isAnonymous?: boolean;
+            action?: string;
+          };
+          pollId      = p.pollId;
+          question    = p.question ?? '';
+          isAnonymous = p.isAnonymous ?? false;
+          action      = media.action ?? '';
+        } catch { /* ignore */ }
+
+        console.log(`[ZaloHandler] Poll event: action="${action}" pollId=${pollId}`);
+
+        if (!pollId) return;
+
+        // Fetch full poll details (options + vote counts)
+        let pollDetail: Awaited<ReturnType<typeof api.getPollDetail>> | undefined;
+        try {
+          pollDetail = await api.getPollDetail(pollId);
+          console.log(`[ZaloHandler] Poll detail: num_vote=${pollDetail?.num_vote} options=`, pollDetail?.options?.map((o: { content: string; votes: number }) => `${o.content}=${o.votes}`).join(','));
+        } catch (e) {
+          console.warn('[ZaloHandler] getPollDetail failed:', e);
+        }
+
+        const existingEntry = pollStore.getByPollId(pollId);
+        console.log(`[ZaloHandler] Poll existingEntry=${existingEntry ? 'found' : 'NOT found'}`);
+        type ZaloPollOption = { option_id: number; content: string; votes: number; voted: boolean; voters: string[] };
+
+        if (action === 'create' && !existingEntry) {
+          const options: ZaloPollOption[] = pollDetail?.options ?? [];
+          if (options.length < 2) {
+            // Can't create TG poll with < 2 options, send as text
+            const text = type === ThreadType.Group
+              ? `${groupCaption(senderName)}📊 <b>${escapeHtml(question)}</b>\n<i>Cuộc bình chọn mới (${options.length} lựa chọn)</i>`
+              : `📊 <b>${escapeHtml(question)}</b>`;
+            const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
+            saveTgMapping(sent);
+            return;
+          }
+
+          const header = type === ThreadType.Group
+            ? `${senderName} tạo bình chọn`
+            : 'Bình chọn mới';
+
+          const tgPollMsg = await tgBot.telegram.sendPoll(
+            config.telegram.groupId,
+            question,
+            options.map(o => o.content),
+            {
+              ...tgBase,
+              is_anonymous:        isAnonymous,
+              allows_multiple_answers: pollDetail?.allow_multi_choices ?? false,
+              question_parse_mode: undefined,
+            } as Parameters<typeof tgBot.telegram.sendPoll>[3],
+          );
+
+          // Send editable score message below
+          const scoreText = buildScoreText(header, pollDetail?.options ?? [], pollDetail?.closed ?? false);
+          const tgScoreMsg = await tgBot.telegram.sendMessage(
+            config.telegram.groupId,
+            scoreText,
+            { message_thread_id: topicId, parse_mode: 'HTML' },
+          );
+
+          pollStore.save({
+            pollId,
+            zaloGroupId:  zaloId,
+            tgPollMsgId:  tgPollMsg.message_id,
+            tgPollUUID:   (tgPollMsg as { poll?: { id?: string } }).poll?.id ?? '',
+            tgScoreMsgId: tgScoreMsg.message_id,
+            tgThreadId:   topicId,
+            options: options.map(o => ({ option_id: o.option_id, content: o.content })),
+          });
+          saveTgMapping(tgPollMsg);
+        } else {
+          // ── Vote update (or unknown existing poll after restart) ──────────
+          // Small delay so Zalo server has time to record the vote before we fetch
+          await new Promise(r => setTimeout(r, 800));
+          let updatedDetail = pollDetail;
+          try { updatedDetail = await api.getPollDetail(pollId); } catch { /* use existing */ }
+          const header = type === ThreadType.Group
+            ? `${senderName} vừa bình chọn`
+            : 'Cập nhật bình chọn';
+          const detailOptions = updatedDetail?.options ?? [];
+          const scoreText = buildScoreText(
+            header,
+            detailOptions.length > 0 ? detailOptions : (existingEntry?.options.map(o => ({ ...o, votes: 0, voted: false, voters: [] })) ?? []),
+            updatedDetail?.closed ?? false,
+          );
+          console.log(`[ZaloHandler] Poll ${pollId} score:`, detailOptions.map((o: { content: string; votes: number }) => `${o.content}=${o.votes}`).join(', '));
+
+          if (existingEntry) {
+            try {
+              await tgBot.telegram.editMessageText(
+                config.telegram.groupId,
+                existingEntry.tgScoreMsgId,
+                undefined,
+                scoreText,
+                {
+                  parse_mode: 'HTML',
+                  reply_markup: updatedDetail?.closed
+                    ? { inline_keyboard: [] }
+                    : { inline_keyboard: [[{ text: '🔒 Khoá bình chọn', callback_data: `lock_poll:${pollId}` }]] },
+                },
+              );
+              console.log(`[ZaloHandler] Poll ${pollId} score message edited OK`);
+            } catch (editErr) {
+              console.warn(`[ZaloHandler] Poll ${pollId} edit failed, sending new:`, editErr);
+              const newScore = await tgBot.telegram.sendMessage(
+                config.telegram.groupId,
+                scoreText,
+                { message_thread_id: existingEntry.tgThreadId, parse_mode: 'HTML',
+                  reply_parameters: { message_id: existingEntry.tgPollMsgId, allow_sending_without_reply: true } },
+              );
+              pollStore.updateScoreMsg(pollId, newScore.message_id);
+            }
+          } else {
+            // existingEntry lost (bot restarted) — just send score as standalone message
+            const sent = await tgBot.telegram.sendMessage(
+              config.telegram.groupId,
+              scoreText,
+              { ...tgBase, parse_mode: 'HTML' },
+            );
+            saveTgMapping(sent);
+          }
+        }
+        return;
+      }
+
       // ── Fallback ───────────────────────────────────────────────────────────
       console.log(`[ZaloHandler] Unhandled msgType="${msgType}" content:`, JSON.stringify(msg.data.content));
       const fallback = type === ThreadType.Group
@@ -579,10 +782,63 @@ export function setupZaloHandler(api: ZaloAPI): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   api.listener.on('group_event', async (event: any) => {
     try {
-      const type  = event?.type as string | undefined;
-      const data  = event?.data;
+      const type    = event?.type as string | undefined;
+      const data    = event?.data;
       const groupId = String(event?.threadId ?? data?.groupId ?? '');
       if (!groupId) return;
+
+      // ── Poll vote: UPDATE_BOARD with BoardType.Poll ────────────────────────
+      if (type === 'update_board' || type === 'remove_board') {
+        // groupTopic.params is a JSON string containing poll info
+        const rawParams = data?.groupTopic?.params ?? data?.topic?.params ?? '';
+        let params: { boardType?: number; pollId?: number } = {};
+        try { params = JSON.parse(rawParams); } catch { /* ignore */ }
+        // BoardType.Poll = 3
+        if (params.boardType === 3 && params.pollId) {
+          const pollId = params.pollId;
+          console.log(`[ZaloHandler] group_event update_board pollId=${pollId}`);
+          const entry = pollStore.getByPollId(pollId);
+          if (entry) {
+            await new Promise(r => setTimeout(r, 600));
+            let detail: Awaited<ReturnType<typeof api.getPollDetail>> | undefined;
+            try { detail = await api.getPollDetail(pollId); } catch { /* ignore */ }
+            if (detail?.options) {
+              const actorName = data?.updateMembers?.[0]?.dName ?? data?.creatorId ?? '';
+              const header = actorName ? `${actorName} vừa bình chọn` : 'Cập nhật bình chọn';
+              const scoreText = buildScoreText(header, detail.options, detail.closed ?? false);
+              console.log(`[ZaloHandler] Poll ${pollId} update:`, detail.options.map((o: { content: string; votes: number }) => `${o.content}=${o.votes}`).join(', '));
+              try {
+                await tgBot.telegram.editMessageText(
+                  config.telegram.groupId,
+                  entry.tgScoreMsgId,
+                  undefined,
+                  scoreText,
+                  {
+                    parse_mode: 'HTML',
+                    reply_markup: detail.closed
+                      ? { inline_keyboard: [] }
+                      : { inline_keyboard: [[{ text: '🔒 Khoá bình chọn', callback_data: `lock_poll:${pollId}` }]] },
+                  },
+                );
+              } catch {
+                const newScore = await tgBot.telegram.sendMessage(
+                  config.telegram.groupId,
+                  scoreText,
+                  { message_thread_id: entry.tgThreadId, parse_mode: 'HTML',
+                    reply_parameters: { message_id: entry.tgPollMsgId, allow_sending_without_reply: true },
+                    reply_markup: detail.closed
+                      ? { inline_keyboard: [] }
+                      : { inline_keyboard: [[{ text: '🔒 Khoá bình chọn', callback_data: `lock_poll:${pollId}` }]] } },
+                );
+                pollStore.updateScoreMsg(pollId, newScore.message_id);
+              }
+            }
+          } else {
+            console.log(`[ZaloHandler] update_board pollId=${pollId} not in pollStore (no TG mapping)`);
+          }
+        }
+        return;
+      }
 
       // Only notify for join/leave/remove — skip setting changes, pins, etc.
       const NOTIFY_TYPES = new Set(['join', 'leave', 'remove_member', 'block_member']);

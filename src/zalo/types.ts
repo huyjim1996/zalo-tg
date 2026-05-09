@@ -39,6 +39,7 @@ export const ZALO_MSG_TYPES = {
   GIF:        'chat.gif',
   LOCATION:   'chat.location.new',
   WEBCONTENT: 'chat.webcontent',
+  POLL:       'group.poll',
 } as const;
 
 /** A single @mention inside a Zalo group message. */

@@ -254,3 +254,49 @@ export const sentMsgStore = {
     return _sentMap.get(tgMsgId);
   },
 };
+
+// ── Poll store (Zalo ↔ TG native poll) ───────────────────────────────────────
+
+export interface PollEntry {
+  pollId:           number;
+  zaloGroupId:      string;
+  tgPollMsgId:      number;    // TG message_id of the bot-owned clone poll
+  tgOrigPollMsgId?: number;    // TG message_id of the user's original poll (to stopPoll on lock)
+  tgPollUUID:       string;    // TG poll identifier from ctx.pollAnswer.poll_id
+  tgScoreMsgId:     number;    // TG message_id of the editable vote-count text below
+  tgThreadId:       number;    // Forum thread (topic) id
+  options: {
+    option_id: number;
+    content:   string;
+  }[];
+}
+
+const _pollByZaloId = new Map<number, PollEntry>();       // pollId → entry
+const _pollByTgId   = new Map<number, PollEntry>();       // tgPollMsgId → entry
+const _pollByUUID   = new Map<string, PollEntry>();       // tgPollUUID → entry
+
+export const pollStore = {
+  save(entry: PollEntry): void {
+    _pollByZaloId.set(entry.pollId, entry);
+    _pollByTgId.set(entry.tgPollMsgId, entry);
+    _pollByUUID.set(entry.tgPollUUID, entry);
+  },
+
+  getByPollId(pollId: number): PollEntry | undefined {
+    return _pollByZaloId.get(pollId);
+  },
+
+  getByTgMsgId(tgMsgId: number): PollEntry | undefined {
+    return _pollByTgId.get(tgMsgId);
+  },
+
+  getByTgPollUUID(uuid: string): PollEntry | undefined {
+    return _pollByUUID.get(uuid);
+  },
+
+  /** Update tgScoreMsgId after editing */
+  updateScoreMsg(pollId: number, newMsgId: number): void {
+    const e = _pollByZaloId.get(pollId);
+    if (e) e.tgScoreMsgId = newMsgId;
+  },
+};

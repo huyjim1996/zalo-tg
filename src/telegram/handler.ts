@@ -3,7 +3,7 @@ import path from 'path';
 import { createReadStream } from 'fs';
 
 import type { ZaloAPI } from '../zalo/types.js';
-import { store, msgStore, userCache, friendsCache, sentMsgStore } from '../store.js';
+import { store, msgStore, userCache, friendsCache, sentMsgStore, pollStore } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp, convertToM4a } from '../utils/media.js';
@@ -278,9 +278,28 @@ export function setupTelegramHandler(
     );
   });
 
-  // ── callback_query: mở topic cho bạn bè Zalo ─────────────────────────────
+  // ── callback_query: mở topic cho bạn bè Zalo + khoá bình chọn ───────────────
   tgBot.on('callback_query', async (ctx) => {
     const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
+
+    // ── Lock poll button ──
+    if (data?.startsWith('lock_poll:')) {
+      const pollId = Number(data.slice('lock_poll:'.length));
+      const entry = pollStore.getByPollId(pollId);
+      if (!entry || !currentApi) {
+        await ctx.answerCbQuery('❌ Không tìm thấy bình chọn.');
+        return;
+      }
+      try {
+        await doLockPoll(entry, currentApi);
+        await ctx.answerCbQuery('✅ Đã khoá bình chọn');
+      } catch (err) {
+        console.error('[TG→Zalo] lock_poll callback error:', err);
+        try { await ctx.answerCbQuery('❌ Lỗi khoá bình chọn'); } catch { /* ignore */ }
+      }
+      return;
+    }
+
     if (!data?.startsWith('sc:')) return;
 
     const userId = data.slice(3);
@@ -696,10 +715,267 @@ export function setupTelegramHandler(
         await sendAttachment(msg.sticker.file_id, `sticker_${Date.now()}.webp`);
         return;
       }
+
+      // ── Native TG Poll → Zalo createPoll ────────────────────────────────────
+      if ('poll' in msg && msg.poll) {
+        const tgPoll = msg.poll;
+        console.log(`[TG→Zalo] Received TG poll: id=${tgPoll.id} question="${tgPoll.question}" is_anonymous=${tgPoll.is_anonymous}`);
+
+        if (threadType !== 1) {
+          await ctx.reply('❌ Chỉ tạo bình chọn được trong nhóm Zalo.', { message_thread_id: topicId });
+          return;
+        }
+
+        try {
+          // 1. Create poll on Zalo
+          const created = await api.createPoll(
+            {
+              question:         tgPoll.question,
+              options:          tgPoll.options.map((o: { text: string }) => o.text),
+              isAnonymous:      false,   // force non-anonymous so poll_answer fires
+              allowMultiChoices: tgPoll.allows_multiple_answers ?? false,
+            },
+            zaloId,
+          );
+          console.log(`[TG→Zalo] Zalo poll created: pollId=${created?.poll_id}`);
+
+          // 2. Bot re-creates the same poll on TG (non-anonymous so bot gets poll_answer)
+          const botPollMsg = await tgBot.telegram.sendPoll(
+            config.telegram.groupId,
+            tgPoll.question,
+            tgPoll.options.map((o: { text: string }) => o.text),
+            {
+              message_thread_id:       topicId,
+              is_anonymous:            false,
+              allows_multiple_answers: tgPoll.allows_multiple_answers ?? false,
+            } as Parameters<typeof tgBot.telegram.sendPoll>[3],
+          );
+          const tgPollUUID = (botPollMsg as { poll?: { id?: string } }).poll?.id ?? '';
+          console.log(`[TG→Zalo] Bot TG poll sent: msgId=${botPollMsg.message_id} uuid=${tgPollUUID}`);
+
+          // 3. Build option list from Zalo response
+          const zaloPollOptions = created?.options ?? tgPoll.options.map((o: { text: string }, i: number) => ({
+            option_id: i, content: o.text, votes: 0,
+          }));
+
+          // 4. Send score message below bot's poll
+          const scoreLines = zaloPollOptions.map((o: { content: string }) =>
+            `${o.content}\n  ${'░'.repeat(10)} 0 phiếu (0%)`,
+          );
+          const scoreText = `📊 <b>Kết quả bình chọn</b>\n<i>(tạo từ Telegram)</i>\n\nTổng: 0 phiếu\n\n${scoreLines.join('\n\n')}`;
+          const lockPollId = created?.poll_id ?? 0;
+          const tgScoreMsg = await tgBot.telegram.sendMessage(
+            config.telegram.groupId,
+            scoreText,
+            {
+              message_thread_id: topicId,
+              parse_mode: 'HTML',
+              reply_parameters: { message_id: botPollMsg.message_id, allow_sending_without_reply: true },
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: '🔒 Khoá bình chọn', callback_data: `lock_poll:${lockPollId}` },
+                ]],
+              },
+            },
+          );
+
+          // 5. Save to pollStore — keyed by both pollId and tgPollUUID
+          if (created?.poll_id) {
+            pollStore.save({
+              pollId:           created.poll_id,
+              zaloGroupId:      zaloId,
+              tgPollMsgId:      botPollMsg.message_id,
+              tgOrigPollMsgId:  msg.message_id,   // user's original poll
+              tgPollUUID:       tgPollUUID,
+              tgScoreMsgId:     tgScoreMsg.message_id,
+              tgThreadId:       topicId,
+              options: zaloPollOptions.map((o: { option_id?: number; content: string }, i: number) => ({
+                option_id: o.option_id ?? i,
+                content:   o.content,
+              })),
+            });
+          }
+        } catch (err) {
+          console.error('[TG→Zalo] createPoll failed:', err);
+          await tgBot.telegram.sendMessage(
+            config.telegram.groupId,
+            '❌ Không thể tạo bình chọn trên Zalo.',
+            { message_thread_id: topicId },
+          );
+        }
+        return;
+      }
+
+      // ── Location ────────────────────────────────────────────────────────────
+      if ('location' in msg && msg.location) {
+        const { latitude, longitude } = msg.location;
+        const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
+        try {
+          // zca-js has no sendLocation — use sendLink for a map preview bubble in Zalo
+          await api.sendLink(
+            { msg: '', link: mapsUrl },
+            zaloId,
+            threadType,
+          );
+          console.log(`[TG→Zalo] Location sent: ${latitude},${longitude}`);
+        } catch (err) {
+          // Fallback: send as plain text link
+          await api.sendMessage({ msg: `📍 ${mapsUrl}` }, zaloId, threadType);
+        }
+        return;
+      }
     } catch (err) {
       console.error('[TG→Zalo] Error:', err);
     }
   });
 
+  // ── Helper: lock poll on both sides ─────────────────────────────────────────
+  async function doLockPoll(entry: import('../store.js').PollEntry, api: ZaloAPI): Promise<void> {
+    await api.lockPoll(entry.pollId);
+    console.log(`[TG→Zalo] Locked Zalo poll ${entry.pollId}`);
+    // Stop bot's clone TG poll
+    try {
+      await tgBot.telegram.stopPoll(config.telegram.groupId, entry.tgPollMsgId);
+    } catch { /* already stopped or no permission */ }
+    // Stop original user poll too (if we have its message_id)
+    if (entry.tgOrigPollMsgId) {
+      try {
+        await tgBot.telegram.stopPoll(config.telegram.groupId, entry.tgOrigPollMsgId);
+      } catch { /* no admin rights or already stopped */ }
+    }
+    // Update score message: show [Đã đóng], remove lock button
+    try {
+      const detail = await api.getPollDetail(entry.pollId);
+      if (detail?.options) {
+        const total = detail.options.reduce((s: number, o: { votes: number }) => s + (o.votes ?? 0), 0);
+        const lines = (detail.options as Array<{ content: string; votes: number }>).map(o => {
+          const pct = total > 0 ? Math.round((o.votes / total) * 100) : 0;
+          const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
+          return `${o.content}\n  ${bar} ${o.votes} phiếu (${pct}%)`;
+        });
+        const scoreText = `📊 <b>Kết quả bình chọn <i>[Đã đóng]</i></b>\n\nTổng: ${total} phiếu\n\n${lines.join('\n\n')}`;
+        try {
+          await tgBot.telegram.editMessageText(
+            config.telegram.groupId,
+            entry.tgScoreMsgId,
+            undefined,
+            scoreText,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          );
+        } catch { /* too old to edit */ }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // ── poll (closed): bot's clone TG poll stopped → lock Zalo poll ─────────────
+  tgBot.on('poll', async (ctx) => {
+    try {
+      const poll = ctx.poll;
+      if (!poll.is_closed) return;
+      const entry = pollStore.getByTgPollUUID(poll.id);
+      if (!entry || !currentApi) return;
+      await doLockPoll(entry, currentApi);
+    } catch (err) {
+      console.error('[TG→Zalo] lockPoll error:', err);
+    }
+  });
+
+
+  // ── poll_answer: TG user votes → forward vote to Zalo ──────────────────────
+  tgBot.on('poll_answer', async (ctx) => {
+    try {
+      const answer = ctx.pollAnswer;
+      // answer.option_ids: array of 0-based indices chosen in TG poll
+      // answer.poll_id: TG internal poll ID (NOT the Zalo pollId)
+      // We track by message_id via pollStore, but Telegraf poll_answer only has poll_id.
+      // pollStore also indexes by tgPollMsgId. TG doesn't give us the message_id in poll_answer,
+      // so we keep a secondary index by TG poll UUID in our store via a separate lookup.
+      // Telegraf ctx.pollAnswer.poll_id is the TG poll identifier — we stored tgPollMsgId.
+      // Workaround: iterate pollStore (small set) by checking tgPollUUID stored during creation.
+
+      // Since we can only look up by tgPollMsgId but TG gives us poll_id (a string UUID),
+      // we store the mapping tgPollUUID → pollId when the poll is sent.
+      const tgPollUUID = answer.poll_id;
+      console.log(`[TG→Zalo] poll_answer: poll_id=${tgPollUUID} option_ids=[${answer.option_ids}]`);
+      const entry = pollStore.getByTgPollUUID(tgPollUUID);
+      if (!entry) {
+        console.log('[TG→Zalo] poll_answer: unknown poll UUID', tgPollUUID);
+        return;
+      }
+
+      if (!currentApi) return;
+      const api = currentApi;
+
+      // Map TG 0-based option indices → Zalo option_ids
+      const optionIds = answer.option_ids
+        .map(idx => entry.options[idx]?.option_id)
+        .filter((id): id is number => id !== undefined);
+
+      // empty option_ids = user retracted vote — refresh score only, no Zalo call
+      const refreshScore = async () => {
+        try {
+          const detail = await api.getPollDetail(entry.pollId);
+          if (!detail?.options) return;
+          const total = detail.options.reduce((s: number, o: { votes: number }) => s + (o.votes ?? 0), 0);
+          const lines = (detail.options as Array<{ content: string; votes: number }>).map(o => {
+            const pct = total > 0 ? Math.round((o.votes / total) * 100) : 0;
+            const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
+            return `${o.content}\n  ${bar} ${o.votes} phiếu (${pct}%)`;
+          });
+          const status = detail.closed ? ' <i>[Đã đóng]</i>' : '';
+          const scoreText = `📊 <b>Kết quả bình chọn${status}</b>\n\nTổng: ${total} phiếu\n\n${lines.join('\n\n')}`;
+          const replyMarkup = detail.closed
+            ? { inline_keyboard: [] as { text: string; callback_data: string }[][] }
+            : { inline_keyboard: [[{ text: '🔒 Khoá bình chọn', callback_data: `lock_poll:${entry.pollId}` }]] };
+          try {
+            await tgBot.telegram.editMessageText(
+              config.telegram.groupId,
+              entry.tgScoreMsgId,
+              undefined,
+              scoreText,
+              { parse_mode: 'HTML', reply_markup: replyMarkup },
+            );
+          } catch {
+            const newMsg = await tgBot.telegram.sendMessage(
+              config.telegram.groupId,
+              scoreText,
+              { message_thread_id: entry.tgThreadId, parse_mode: 'HTML',
+                reply_parameters: { message_id: entry.tgPollMsgId, allow_sending_without_reply: true },
+                reply_markup: replyMarkup },
+            );
+            pollStore.updateScoreMsg(entry.pollId, newMsg.message_id);
+          }
+        } catch (e) {
+          console.warn('[TG→Zalo] poll score refresh failed:', e);
+        }
+      };
+
+      if (optionIds.length === 0) {
+        // Vote retracted — unvote on Zalo then refresh score
+        try {
+          await api.votePoll(entry.pollId, []);
+          console.log(`[TG→Zalo] Unvoted poll ${entry.pollId}`);
+        } catch (e) {
+          console.warn('[TG→Zalo] unvote failed:', e);
+        }
+        await refreshScore();
+        return;
+      }
+
+      // votePoll accepts single id or array
+      await api.votePoll(entry.pollId, optionIds.length === 1 ? optionIds[0] : optionIds);
+      console.log(`[TG→Zalo] Voted poll ${entry.pollId} options [${optionIds}]`);
+
+      // Immediately refresh score message
+      await refreshScore();
+    } catch (err) {
+      console.error('[TG→Zalo] poll_answer error:', err);
+    }
+  });
+
   return setCurrentApi;
 }
+
+// ── NOTE: poll_answer handler is registered at module level (needs tgBot) ────
+// Called by setupTelegramHandler, but defined after so we can reference tgBot directly.
+

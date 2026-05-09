@@ -26,7 +26,7 @@ async function main(): Promise<void> {
   // ── Start Telegram bot so /login can be received immediately ───────────────
   // NOTE: tgBot.launch() runs the polling loop forever, so we must NOT await it.
   // The second argument callback fires once getMe() + deleteWebhook() succeed.
-  tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction'] }, () => {
+  tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
     console.log('[Boot] Telegram bot started ✓');
 
     // ── Attempt Zalo login in background ────────────────────────────────────
