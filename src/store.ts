@@ -236,7 +236,8 @@ export interface SentMsgInfo {
 }
 
 const SENT_MAX = 300;
-const _sentMap   = new Map<number, SentMsgInfo>(); // tgMsgId → info
+const _sentMap      = new Map<number, SentMsgInfo>(); // tgMsgId → info
+const _sentByZaloId = new Map<string, number>();       // String(zaloMsgId) → tgMsgId
 const _sentOrder: number[] = [];
 
 export const sentMsgStore = {
@@ -244,14 +245,28 @@ export const sentMsgStore = {
   save(tgMsgId: number, info: SentMsgInfo): void {
     if (_sentOrder.length >= SENT_MAX) {
       const old = _sentOrder.shift();
-      if (old !== undefined) _sentMap.delete(old);
+      if (old !== undefined) {
+        const oldInfo = _sentMap.get(old);
+        if (oldInfo) _sentByZaloId.delete(String(oldInfo.msgId));
+        _sentMap.delete(old);
+      }
     }
     _sentMap.set(tgMsgId, info);
+    _sentByZaloId.set(String(info.msgId), tgMsgId);
     _sentOrder.push(tgMsgId);
   },
 
   get(tgMsgId: number): SentMsgInfo | undefined {
     return _sentMap.get(tgMsgId);
+  },
+
+  /**
+   * Reverse lookup: given a Zalo msgId we sent (TG→Zalo direction),
+   * return the original TG message_id. Used so Zalo replies to our
+   * sent messages chain correctly on the TG side.
+   */
+  getByZaloMsgId(zaloMsgId: string): number | undefined {
+    return _sentByZaloId.get(zaloMsgId);
   },
 };
 

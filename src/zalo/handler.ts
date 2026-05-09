@@ -10,7 +10,7 @@ import { tgBot } from '../telegram/bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyMentionsHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
-import { msgStore, userCache, pollStore, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, type ZaloQuoteData } from '../store.js';
 
 // ── Bank card HTML parser ────────────────────────────────────────────────────
 interface BankCardInfo {
@@ -198,7 +198,10 @@ export function setupZaloHandler(api: ZaloAPI): void {
       // Resolve Telegram reply target from incoming Zalo quote (if any)
       let tgReplyMsgId: number | undefined;
       if (msg.data.quote) {
-        tgReplyMsgId = msgStore.getTgMsgId(String(msg.data.quote.globalMsgId));
+        const globalId = String(msg.data.quote.globalMsgId);
+        // Primary: messages received from Zalo and forwarded to TG
+        // Fallback: messages we sent from TG to Zalo (reverse lookup)
+        tgReplyMsgId = msgStore.getTgMsgId(globalId) ?? sentMsgStore.getByZaloMsgId(globalId);
       }
 
       // Base TG send options (with optional reply_parameters)
@@ -376,9 +379,21 @@ export function setupZaloHandler(api: ZaloAPI): void {
           }
           const ext = path.extname(url.split('?')[0] ?? '').toLowerCase() || '.webp';
           const localPath = await downloadToTemp(url, `sticker_${Date.now()}${ext}`);
-          const stream = createReadStream(localPath);
           try {
-            const sent = await tgBot.telegram.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
+            let sent: { message_id: number };
+            try {
+              // Try native TG sticker (webp ≤512 KB displays as a proper sticker)
+              const stream = createReadStream(localPath);
+              sent = await tgBot.telegram.sendSticker(
+                config.telegram.groupId,
+                { source: stream },
+                tgBase as Parameters<typeof tgBot.telegram.sendSticker>[2],
+              );
+            } catch {
+              // Fall back to photo if file is too large or format unsupported
+              const stream = createReadStream(localPath);
+              sent = await tgBot.telegram.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
+            }
             saveTgMapping(sent);
           } finally { await cleanTemp(localPath); }
         } catch (stickerErr) {

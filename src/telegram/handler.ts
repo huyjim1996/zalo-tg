@@ -9,7 +9,62 @@ import { config } from '../config.js';
 import { downloadToTemp, cleanTemp, convertToM4a } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
 
-// ── /login command ────────────────────────────────────────────────────────────
+// ── Mention resolution helper ──────────────────────────────────────────────
+
+type TgEntity = { type: string; offset: number; length: number; user?: { first_name: string; last_name?: string } };
+
+/**
+ * Resolve TG mention entities (or plain-text @Name patterns) in a string
+ * to Zalo mention objects. Works for both msg.text+entities and
+ * msg.caption+caption_entities.
+ */
+function resolveTgMentions(
+  text: string,
+  entities: ReadonlyArray<TgEntity> | undefined,
+  forZaloGroup: boolean,
+): Array<{ pos: number; uid: string; len: number }> {
+  const result: Array<{ pos: number; uid: string; len: number }> = [];
+  if (!forZaloGroup) return result;
+
+  // 1. Named TG entities (@username or text_mention with user object)
+  if (entities) {
+    for (const e of entities) {
+      if (e.type === 'mention') {
+        const rawName = text.slice(e.offset + 1, e.offset + e.length); // strip leading @
+        const uid = userCache.resolveByName(rawName);
+        if (uid) result.push({ pos: e.offset, uid, len: e.length });
+      } else if (e.type === 'text_mention' && e.user) {
+        const rawName = e.user.first_name + (e.user.last_name ? ` ${e.user.last_name}` : '');
+        const uid = userCache.resolveByName(rawName);
+        if (uid) result.push({ pos: e.offset, uid, len: e.length });
+      }
+    }
+  }
+
+  // 2. Plain-text @Name patterns (only if no entity matched above)
+  if (result.length === 0) {
+    const atPattern = /@([\p{L}\p{N}_]+(?:\s[\p{L}\p{N}_]+){0,3})/gu;
+    let m: RegExpExecArray | null;
+    while ((m = atPattern.exec(text)) !== null) {
+      const captured = m[1];
+      if (/^(all|everyone|tất\s*cả)$/i.test(captured)) {
+        result.push({ pos: m.index, uid: '-1', len: m[0].length });
+        continue;
+      }
+      const words = captured.split(' ');
+      for (let end = words.length; end >= 1; end--) {
+        const candidate = words.slice(0, end).join(' ');
+        const uid = userCache.resolveByName(candidate);
+        if (uid) {
+          result.push({ pos: m.index, uid, len: ('@' + candidate).length });
+          break;
+        }
+      }
+    }
+  }
+
+  return result;
+}
 
 /** Track in-progress QR login so we don't stack multiple flows. */
 let qrLoginInProgress = false;
@@ -83,8 +138,6 @@ async function handleLoginCommand(
     qrLoginInProgress = false;
   }
 }
-
-// ── Message handler ───────────────────────────────────────────────────────────
 
 /**
  * Wire up Telegram → Zalo forwarding.
@@ -184,7 +237,6 @@ export function setupTelegramHandler(
     );
   });
 
-  // ── /recall – thu hồi tin nhắn Zalo (reply vào tin mình đã gửi) ───────────
   tgBot.command('recall', async (ctx) => {
     if (ctx.chat.id !== config.telegram.groupId) return;
     if (!currentApi) { await ctx.reply('❌ Zalo chưa kết nối'); return; }
@@ -222,7 +274,6 @@ export function setupTelegramHandler(
     }
   });
 
-  // ── /search – tìm bạn bè Zalo theo tên ─────────────────────────────────────
   tgBot.command('search', async (ctx) => {
     if (ctx.chat.id !== config.telegram.groupId) return;
     // /search must be in General (no topicId) or any topic — reply to same thread
@@ -278,11 +329,9 @@ export function setupTelegramHandler(
     );
   });
 
-  // ── callback_query: mở topic cho bạn bè Zalo + khoá bình chọn ───────────────
   tgBot.on('callback_query', async (ctx) => {
     const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
 
-    // ── Lock poll button ──
     if (data?.startsWith('lock_poll:')) {
       const pollId = Number(data.slice('lock_poll:'.length));
       const entry = pollStore.getByPollId(pollId);
@@ -352,7 +401,6 @@ export function setupTelegramHandler(
     }
   });
 
-  // ── message_reaction: TG → Zalo (thả react lên tin nhắn TG → react Zalo) ──
   // Bot phải là admin và allowed_updates phải có "message_reaction"
   tgBot.on('message_reaction', async (ctx) => {
     try {
@@ -507,7 +555,6 @@ export function setupTelegramHandler(
           .catch(() => undefined);
       };
 
-      // ── Text ───────────────────────────────────────────────────────────────
       if ('text' in msg && msg.text) {
         // Skip bot commands that were already handled above
         if (msg.text.startsWith('/')) return;
@@ -516,57 +563,11 @@ export function setupTelegramHandler(
         const replyToMsgId = msg.reply_to_message?.message_id;
         const zaloQuote = replyToMsgId !== undefined ? msgStore.getQuote(replyToMsgId) : undefined;
 
-        // Resolve TG @mention entities → Zalo mentions (group only)
-        const zaloMentions: Array<{ pos: number; uid: string; len: number }> = [];
-        if (threadType === ThreadType.Group) {
-          // 1. Named entities (user tapped a TG contact mention)
-          if ('entities' in msg && msg.entities) {
-            for (const e of msg.entities) {
-              if (e.type === 'mention') {
-                // @username — strip leading @
-                const rawName = msg.text.slice(e.offset + 1, e.offset + e.length);
-                const uid = userCache.resolveByName(rawName);
-                if (uid) zaloMentions.push({ pos: e.offset, uid, len: e.length });
-              } else if (e.type === 'text_mention' && 'user' in e && e.user) {
-                const u = e.user as { first_name: string; last_name?: string };
-                const rawName = u.first_name + (u.last_name ? ` ${u.last_name}` : '');
-                const uid = userCache.resolveByName(rawName);
-                if (uid) zaloMentions.push({ pos: e.offset, uid, len: e.length });
-              }
-            }
-          }
-
-          // 2. Plain-text @Name patterns (no TG entity) — scan text for @Word
-          if (zaloMentions.length === 0) {
-            // Capture up to 4 words after @, then try longest→shortest to resolve
-            const atPattern = /@([\p{L}\p{N}_]+(?:\s[\p{L}\p{N}_]+){0,3})/gu;
-            let m: RegExpExecArray | null;
-            while ((m = atPattern.exec(msg.text)) !== null) {
-              const captured = m[1];
-              // @all / @everyone → Zalo mention-all (uid = "-1")
-              if (/^(all|everyone|tất\s*cả)$/i.test(captured)) {
-                zaloMentions.push({ pos: m.index, uid: '-1', len: m[0].length });
-                continue;
-              }
-              // Try progressively shorter substrings (longest match wins)
-              const words = captured.split(' ');
-              let resolved = false;
-              for (let end = words.length; end >= 1; end--) {
-                const candidate = words.slice(0, end).join(' ');
-                const uid = userCache.resolveByName(candidate);
-                if (uid) {
-                  const matchStr = '@' + candidate;
-                  zaloMentions.push({ pos: m.index, uid, len: matchStr.length });
-                  resolved = true;
-                  break;
-                }
-              }
-              if (!resolved) {
-                // Advance past @word so we don't re-scan same position
-              }
-            }
-          }
-        }
+        const zaloMentions = resolveTgMentions(
+          msg.text,
+          ('entities' in msg ? msg.entities : undefined) as ReadonlyArray<TgEntity> | undefined,
+          threadType === ThreadType.Group,
+        );
 
         try {
           const sendResult = await api.sendMessage(
@@ -598,7 +599,13 @@ export function setupTelegramHandler(
         );
       };
 
-      const sendAttachment = async (fileId: string, filename: string, fileSize?: number) => {
+      const sendAttachment = async (
+        fileId: string,
+        filename: string,
+        fileSize?: number,
+        caption?: string,
+        captionMentions?: Array<{ pos: number; uid: string; len: number }>,
+      ) => {
         // Telegram Bot API cannot download files > 20 MB
         if (fileSize !== undefined && fileSize > TG_FILE_LIMIT) {
           await notifyTooBig(filename, fileSize);
@@ -621,7 +628,12 @@ export function setupTelegramHandler(
         try {
           console.log(`[TG→Zalo] Sending ${filename} → zaloId=${zaloId} type=${threadType}`);
           const sendPromise = api.sendMessage(
-            { msg: '', attachments: [localPath], ...(zaloQuote ? { quote: zaloQuote } : {}) },
+            {
+              msg: caption ?? '',
+              attachments: [localPath],
+              ...(zaloQuote ? { quote: zaloQuote } : {}),
+              ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+            },
             zaloId,
             threadType,
           );
@@ -644,37 +656,48 @@ export function setupTelegramHandler(
         }
       };
 
-      // ── Photo ──────────────────────────────────────────────────────────────
+      // Helper: extract caption + resolved mentions from any media message
+      const getCaptionMentions = () => {
+        const cap = ('caption' in msg ? (msg as { caption?: string }).caption : undefined);
+        const capEntities = ('caption_entities' in msg
+          ? (msg as { caption_entities?: ReadonlyArray<TgEntity> }).caption_entities
+          : undefined);
+        const capMentions = cap
+          ? resolveTgMentions(cap, capEntities, threadType === ThreadType.Group)
+          : undefined;
+        return { cap, capMentions };
+      };
+
       if ('photo' in msg && msg.photo && msg.photo.length > 0) {
         const photo = msg.photo[msg.photo.length - 1]!;
-        await sendAttachment(photo.file_id, 'photo.jpg', photo.file_size);
+        const { cap, capMentions } = getCaptionMentions();
+        await sendAttachment(photo.file_id, 'photo.jpg', photo.file_size, cap, capMentions);
         return;
       }
 
-      // ── Animation / GIF ────────────────────────────────────────────────────
       if ('animation' in msg && msg.animation) {
         const fname = msg.animation.file_name ?? 'animation.gif';
-        await sendAttachment(msg.animation.file_id, fname, msg.animation.file_size);
+        const { cap, capMentions } = getCaptionMentions();
+        await sendAttachment(msg.animation.file_id, fname, msg.animation.file_size, cap, capMentions);
         return;
       }
 
-      // ── Document / File ────────────────────────────────────────────────────
       if ('document' in msg && msg.document) {
         const doc   = msg.document;
         const fname = doc.file_name ?? `file_${Date.now()}.bin`;
-        await sendAttachment(doc.file_id, fname, doc.file_size);
+        const { cap, capMentions } = getCaptionMentions();
+        await sendAttachment(doc.file_id, fname, doc.file_size, cap, capMentions);
         return;
       }
 
-      // ── Video ──────────────────────────────────────────────────────────────
       if ('video' in msg && msg.video) {
         const vid   = msg.video;
         const fname = vid.file_name ?? `video_${Date.now()}.mp4`;
-        await sendAttachment(vid.file_id, fname, vid.file_size);
+        const { cap, capMentions } = getCaptionMentions();
+        await sendAttachment(vid.file_id, fname, vid.file_size, cap, capMentions);
         return;
       }
 
-      // ── Voice note ─────────────────────────────────────────────────────────
       if ('voice' in msg && msg.voice) {
         // Telegram voice notes are always small (<1 min OGG Opus), well under 20 MB
         if ((msg.voice.file_size ?? 0) > TG_FILE_LIMIT) {
@@ -710,13 +733,17 @@ export function setupTelegramHandler(
         return;
       }
 
-      // ── Sticker ────────────────────────────────────────────────────────────
       if ('sticker' in msg && msg.sticker) {
-        await sendAttachment(msg.sticker.file_id, `sticker_${Date.now()}.webp`);
+        const sticker = msg.sticker;
+        // For animated (tgs) or video (webm) stickers, use the jpg thumbnail
+        // so Zalo receives a viewable image instead of a binary animation blob.
+        const useThumb = (sticker.is_animated || sticker.is_video) && sticker.thumbnail;
+        const fileId   = useThumb ? sticker.thumbnail!.file_id : sticker.file_id;
+        const ext      = useThumb ? '.jpg' : '.webp';
+        await sendAttachment(fileId, `sticker_${Date.now()}${ext}`);
         return;
       }
 
-      // ── Native TG Poll → Zalo createPoll ────────────────────────────────────
       if ('poll' in msg && msg.poll) {
         const tgPoll = msg.poll;
         console.log(`[TG→Zalo] Received TG poll: id=${tgPoll.id} question="${tgPoll.question}" is_anonymous=${tgPoll.is_anonymous}`);
@@ -806,7 +833,6 @@ export function setupTelegramHandler(
         return;
       }
 
-      // ── Location ────────────────────────────────────────────────────────────
       if ('location' in msg && msg.location) {
         const { latitude, longitude } = msg.location;
         const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
@@ -829,7 +855,6 @@ export function setupTelegramHandler(
     }
   });
 
-  // ── Helper: lock poll on both sides ─────────────────────────────────────────
   async function doLockPoll(entry: import('../store.js').PollEntry, api: ZaloAPI): Promise<void> {
     await api.lockPoll(entry.pollId);
     console.log(`[TG→Zalo] Locked Zalo poll ${entry.pollId}`);
@@ -867,7 +892,6 @@ export function setupTelegramHandler(
     } catch { /* non-fatal */ }
   }
 
-  // ── poll (closed): bot's clone TG poll stopped → lock Zalo poll ─────────────
   tgBot.on('poll', async (ctx) => {
     try {
       const poll = ctx.poll;
@@ -880,8 +904,6 @@ export function setupTelegramHandler(
     }
   });
 
-
-  // ── poll_answer: TG user votes → forward vote to Zalo ──────────────────────
   tgBot.on('poll_answer', async (ctx) => {
     try {
       const answer = ctx.pollAnswer;
@@ -976,6 +998,5 @@ export function setupTelegramHandler(
   return setCurrentApi;
 }
 
-// ── NOTE: poll_answer handler is registered at module level (needs tgBot) ────
 // Called by setupTelegramHandler, but defined after so we can reference tgBot directly.
 
