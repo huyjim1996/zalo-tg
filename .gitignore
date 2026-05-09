@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment & secrets — KHÔNG commit các file này
+.env
+credentials.json
+*.json.bak
+
+# Dữ liệu runtime
+data/topics.json
+data/*.json
+tmp/
+
+# Logs
+*.log
+npm-debug.log*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
