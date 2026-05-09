@@ -3,7 +3,7 @@ import path from 'path';
 import { createReadStream } from 'fs';
 
 import type { ZaloAPI } from '../zalo/types.js';
-import { store, msgStore, userCache, friendsCache, sentMsgStore, pollStore } from '../store.js';
+import { store, msgStore, userCache, friendsCache, sentMsgStore, pollStore, mediaGroupStore } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp, convertToM4a } from '../utils/media.js';
@@ -668,9 +668,66 @@ export function setupTelegramHandler(
         return { cap, capMentions };
       };
 
+      // Helper: flush a media group — download all files and send as single Zalo message
+      const flushMediaGroup = async (
+        items: import('../store.js').MediaGroupItem[],
+        meta: { topicId: number; zaloId: string; threadType: 0 | 1; replyToMsgId?: number },
+      ) => {
+        const replyMsgId = meta.replyToMsgId;
+        const zaloQuote = replyMsgId !== undefined ? msgStore.getQuote(replyMsgId) : undefined;
+        const caption = items[0]?.caption ?? '';
+        const capMentions = items[0]?.captionMentions;
+        const localPaths: string[] = [];
+        try {
+          for (const item of items) {
+            if ((item.fileSize ?? 0) > 20 * 1024 * 1024) continue; // skip oversized
+            let fileLink: URL;
+            try { fileLink = await tgBot.telegram.getFileLink(item.fileId); }
+            catch { continue; }
+            localPaths.push(await downloadToTemp(fileLink.toString(), item.fname));
+          }
+          if (localPaths.length === 0) return;
+          const sendResult = await api.sendMessage(
+            {
+              msg: caption,
+              attachments: localPaths,
+              ...(zaloQuote ? { quote: zaloQuote } : {}),
+              ...(capMentions?.length ? { mentions: capMentions } : {}),
+            },
+            meta.zaloId,
+            meta.threadType === 1 ? ThreadType.Group : ThreadType.User,
+          );
+          const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
+          if (zaloMsgId !== undefined) {
+            // We don't have a single tgMsgId here (multiple), just skip sentMsgStore
+            console.log(`[TG→Zalo] Media group sent: ${localPaths.length} files, zaloMsgId=${zaloMsgId}`);
+          }
+        } catch (err) {
+          console.error('[TG→Zalo] Media group send failed:', err);
+        } finally {
+          for (const lp of localPaths) await cleanTemp(lp);
+        }
+      };
+
+      // Capture api reference for closures (already defined above but re-alias for flush closure)
+      const _api = api;
+
       if ('photo' in msg && msg.photo && msg.photo.length > 0) {
         const photo = msg.photo[msg.photo.length - 1]!;
         const { cap, capMentions } = getCaptionMentions();
+        const mediaGroupId = ('media_group_id' in msg ? (msg as { media_group_id?: string }).media_group_id : undefined);
+        if (mediaGroupId) {
+          const replyToMsgId = msg.reply_to_message?.message_id;
+          mediaGroupStore.add(
+            mediaGroupId,
+            { fileId: photo.file_id, fname: 'photo.jpg', fileSize: photo.file_size, caption: cap, captionMentions: capMentions },
+            { topicId, zaloId, threadType: entry.type, replyToMsgId },
+            (items, meta) => { void flushMediaGroup(items, meta); },
+          );
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          void _api; // keep reference
+          return;
+        }
         await sendAttachment(photo.file_id, 'photo.jpg', photo.file_size, cap, capMentions);
         return;
       }
@@ -694,6 +751,17 @@ export function setupTelegramHandler(
         const vid   = msg.video;
         const fname = vid.file_name ?? `video_${Date.now()}.mp4`;
         const { cap, capMentions } = getCaptionMentions();
+        const mediaGroupId = ('media_group_id' in msg ? (msg as { media_group_id?: string }).media_group_id : undefined);
+        if (mediaGroupId) {
+          const replyToMsgId = msg.reply_to_message?.message_id;
+          mediaGroupStore.add(
+            mediaGroupId,
+            { fileId: vid.file_id, fname, fileSize: vid.file_size, caption: cap, captionMentions: capMentions },
+            { topicId, zaloId, threadType: entry.type, replyToMsgId },
+            (items, meta) => { void flushMediaGroup(items, meta); },
+          );
+          return;
+        }
         await sendAttachment(vid.file_id, fname, vid.file_size, cap, capMentions);
         return;
       }
@@ -847,6 +915,28 @@ export function setupTelegramHandler(
         } catch (err) {
           // Fallback: send as plain text link
           await api.sendMessage({ msg: `📍 ${mapsUrl}` }, zaloId, threadType);
+        }
+        return;
+      }
+
+      if ('contact' in msg && msg.contact) {
+        const contact = msg.contact as { phone_number: string; first_name: string; last_name?: string; user_id?: number };
+        const fullName = [contact.first_name, contact.last_name].filter(Boolean).join(' ');
+        // Try to send via sendCard if we can resolve the Zalo UID from the phone number
+        // Fall back to sending contact info as a plain text message
+        let cardSent = false;
+        if (contact.user_id) {
+          // TG user_id is not Zalo UID, skip sendCard attempt
+        }
+        if (!cardSent) {
+          const body = `👤 <b>Danh thiếp</b>\nTên: <b>${fullName}</b>\nSĐT: <code>${contact.phone_number}</code>`;
+          try {
+            await api.sendMessage({ msg: `👤 ${fullName} — ${contact.phone_number}` }, zaloId, threadType);
+          } catch (err) {
+            await notifyError('sendContact', err);
+          }
+          // Also send formatted version on TG side as confirmation (just log)
+          void body;
         }
         return;
       }

@@ -10,7 +10,7 @@ import { tgBot } from '../telegram/bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyMentionsHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, type ZaloQuoteData } from '../store.js';
 
 // ── Bank card HTML parser ────────────────────────────────────────────────────
 interface BankCardInfo {
@@ -98,6 +98,7 @@ async function getOrCreateTopic(
   zaloId: string,
   type: 0 | 1,
   displayName: string,
+  avatarUrl?: string,
 ): Promise<number> {
   const existing = store.getTopicByZalo(zaloId, type);
   if (existing !== undefined) return existing;
@@ -114,6 +115,30 @@ async function getOrCreateTopic(
   const topicId = topic.message_thread_id;
   store.set({ topicId, zaloId, type, name: displayName });
   console.log(`[Zalo→TG] New topic: "${name}" (topicId=${topicId})`);
+
+  // Pin group avatar as the first message in the topic
+  if (type === 1 /* Group */ && avatarUrl) {
+    try {
+      const localPath = await downloadToTemp(avatarUrl, `avatar_${Date.now()}.jpg`);
+      const stream = createReadStream(localPath);
+      const avatarMsg = await tgBot.telegram.sendPhoto(
+        config.telegram.groupId,
+        { source: stream },
+        {
+          message_thread_id: topicId,
+          caption: `🖼 Ảnh đại diện nhóm <b>${escapeHtml(displayName)}</b>`,
+          parse_mode: 'HTML',
+        },
+      );
+      await cleanTemp(localPath);
+      try {
+        await tgBot.telegram.pinChatMessage(config.telegram.groupId, avatarMsg.message_id, { disable_notification: true });
+      } catch { /* pinning requires admin rights */ }
+    } catch (avatarErr) {
+      console.warn(`[Zalo→TG] Failed to pin group avatar for ${displayName}:`, avatarErr);
+    }
+  }
+
   return topicId;
 }
 
@@ -186,14 +211,16 @@ export function setupZaloHandler(api: ZaloAPI): void {
 
       // Resolve group name
       let displayName = senderName;
+      let groupAvatarUrl: string | undefined;
       if (type === ThreadType.Group) {
         try {
           const info = await api.getGroupInfo(zaloId) as ZaloGroupInfoResponse;
           displayName = info?.gridInfoMap?.[zaloId]?.name ?? senderName;
+          groupAvatarUrl = info?.gridInfoMap?.[zaloId]?.avt;
         } catch { /* non-fatal */ }
       }
 
-      const topicId = await getOrCreateTopic(zaloId, type, displayName);
+      const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
 
       // Resolve Telegram reply target from incoming Zalo quote (if any)
       let tgReplyMsgId: number | undefined;
@@ -268,12 +295,89 @@ export function setupZaloHandler(api: ZaloAPI): void {
           } catch { /* ignore */ }
         }
         if (!url) { console.warn('[ZaloHandler] Photo: no URL found in content:', media); return; }
-        const localPath = await downloadToTemp(url, `photo_${Date.now()}.jpg`);
-        const stream = createReadStream(localPath);
-        try {
-          const sent = await tgBot.telegram.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
-          saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+
+        const childnumber: number = (media as { childnumber?: number }).childnumber ?? 0;
+        const albumKey = `${zaloId}:${msg.data.uidFrom}`;
+
+        // If childnumber > 0 OR there's already a buffer for this key → album mode
+        const hasBuffer = (typeof zaloAlbumStore as unknown as { _has?: (k: string) => boolean })._has?.(albumKey);
+        void hasBuffer; // unused, we detect via the add callback
+
+        zaloAlbumStore.add(
+          albumKey,
+          url,
+          zaloMsgIds[0],
+          { senderName, topicId, tgBase, zaloQuote: zaloQuoteData },
+          async (buf) => {
+            if (buf.urls.length === 1) {
+              // Single photo — send normally
+              const singleUrl = buf.urls[0]!;
+              const localPath = await downloadToTemp(singleUrl, `photo_${Date.now()}.jpg`);
+              const stream = createReadStream(localPath);
+              try {
+                const sent = await tgBot.telegram.sendPhoto(
+                  config.telegram.groupId,
+                  { source: stream },
+                  {
+                    ...buf.tgBase,
+                    parse_mode: 'HTML' as const,
+                    caption: type === ThreadType.Group ? groupCaption(buf.senderName) : undefined,
+                  },
+                );
+                msgStore.save(sent.message_id, buf.zaloMsgIds, {
+                  msgId: buf.zaloMsgIds[0]!,
+                  cliMsgId: '',
+                  uidFrom: msg.data.uidFrom,
+                  ts: msg.data.ts,
+                  msgType,
+                  content: msg.data.content as string | Record<string, unknown>,
+                  ttl: msg.data.ttl ?? 0,
+                  zaloId,
+                  threadType: type,
+                });
+              } finally { await cleanTemp(localPath); }
+            } else {
+              // Multi-photo album — download all and send as media group
+              const localPaths: string[] = [];
+              try {
+                for (const u of buf.urls) {
+                  localPaths.push(await downloadToTemp(u, `photo_${Date.now()}.jpg`));
+                }
+                const captionText = type === ThreadType.Group ? groupCaption(buf.senderName) : undefined;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const mediaItems: any[] = localPaths.map((lp, i) => ({
+                  type: 'photo',
+                  media: { source: createReadStream(lp) },
+                  ...(i === 0 && captionText ? { caption: captionText, parse_mode: 'HTML' } : {}),
+                }));
+                const sentMsgs = await tgBot.telegram.sendMediaGroup(
+                  config.telegram.groupId,
+                  mediaItems,
+                  { message_thread_id: buf.topicId } as Parameters<typeof tgBot.telegram.sendMediaGroup>[2],
+                );
+                // Save mapping for first photo (for reply chain)
+                if (sentMsgs.length > 0) {
+                  msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, {
+                    msgId: buf.zaloMsgIds[0]!,
+                    cliMsgId: '',
+                    uidFrom: msg.data.uidFrom,
+                    ts: msg.data.ts,
+                    msgType,
+                    content: msg.data.content as string | Record<string, unknown>,
+                    ttl: msg.data.ttl ?? 0,
+                    zaloId,
+                    threadType: type,
+                  });
+                }
+              } finally {
+                for (const lp of localPaths) await cleanTemp(lp);
+              }
+            }
+          },
+        );
+
+        // Peek: if childnumber === 0 and no existing buffer, timer fires immediately
+        // (actually always deferred 600ms — that's fine)
         return;
       }
 
@@ -667,6 +771,60 @@ export function setupZaloHandler(api: ZaloAPI): void {
       }
 
       // ── Fallback ───────────────────────────────────────────────────────────
+      // Before fallback: detect contact card by content shape (contactUid field)
+      // Zalo sends contact cards as msgType 'chat.forward' with contactUid in content
+      {
+        const rawContent = msg.data.content;
+        const contactUid: string | undefined =
+          (typeof rawContent === 'object' && rawContent !== null && 'contactUid' in rawContent)
+            ? String((rawContent as Record<string, unknown>).contactUid)
+            : (media.contactUid ? String(media.contactUid) : undefined);
+
+        if (contactUid || msgType === ZALO_MSG_TYPES.CONTACT) {
+          const uid = contactUid ?? '';
+          // Fetch display name from userCache or API
+          let contactName = userCache.getName(uid) ?? uid;
+          if (uid && contactName === uid) {
+            try {
+              const resp = await api.getUserInfo(uid) as {
+                changed_profiles?: Record<string, { displayName?: string }>;
+              };
+              contactName = resp?.changed_profiles?.[uid]?.displayName ?? uid;
+              if (contactName !== uid) userCache.save(uid, contactName);
+            } catch { /* non-fatal */ }
+          }
+          const qrUrl: string | undefined =
+            (typeof rawContent === 'object' && rawContent !== null && 'qrCodeUrl' in rawContent)
+              ? String((rawContent as Record<string, unknown>).qrCodeUrl)
+              : media.qrCodeUrl;
+
+          const body = `👤 <b>Danh thiếp</b>\nTên: <b>${escapeHtml(contactName)}</b>\nZalo ID: <code>${uid}</code>`;
+          const fullText = type === ThreadType.Group ? `${groupCaption(senderName)}\n${body}` : body;
+
+          if (qrUrl) {
+            // Send QR code image + caption
+            try {
+              const localPath = await downloadToTemp(qrUrl, `qr_${Date.now()}.jpg`);
+              const stream = createReadStream(localPath);
+              const sent = await tgBot.telegram.sendPhoto(
+                config.telegram.groupId,
+                { source: stream },
+                { ...tgBase, caption: fullText, parse_mode: 'HTML' },
+              );
+              saveTgMapping(sent);
+              await cleanTemp(localPath);
+            } catch {
+              const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, fullText, { ...tgBase, parse_mode: 'HTML' });
+              saveTgMapping(sent);
+            }
+          } else {
+            const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, fullText, { ...tgBase, parse_mode: 'HTML' });
+            saveTgMapping(sent);
+          }
+          return;
+        }
+      }
+
       console.log(`[ZaloHandler] Unhandled msgType="${msgType}" content:`, JSON.stringify(msg.data.content));
       const fallback = type === ThreadType.Group
         ? `${groupCaption(senderName)}\n<i>[${msgType}]</i>`
