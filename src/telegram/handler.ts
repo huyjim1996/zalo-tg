@@ -570,7 +570,7 @@ export function setupTelegramHandler(
         );
 
         try {
-          const sendResult = await api.sendMessage(
+          let sendResult = await api.sendMessage(
             {
               msg: msg.text,
               ...(zaloQuote ? { quote: zaloQuote } : {}),
@@ -578,7 +578,23 @@ export function setupTelegramHandler(
             },
             zaloId,
             threadType,
-          );
+          ).catch(async (err: unknown) => {
+            // Code 114 often means the quote data is incompatible (e.g. quoting
+            // a media message whose content structure differs from what zca-js
+            // expects). Retry without the quote so the text still goes through.
+            if ((err as { code?: number }).code === 114 && zaloQuote) {
+              console.warn('[TG→Zalo] code 114 with quote, retrying without quote');
+              return api.sendMessage(
+                {
+                  msg: msg.text,
+                  ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
+                },
+                zaloId,
+                threadType,
+              );
+            }
+            throw err;
+          });
           const zaloMsgId = sendResult?.message?.msgId;
           if (zaloMsgId !== undefined) {
             sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
@@ -637,23 +653,36 @@ export function setupTelegramHandler(
           // zca-js splits internally when msg is non-empty + quote is set:
           //   1) sends caption+quote as text (reply indicator in Zalo)
           //   2) sends attachment without quote
-          // When caption is empty but quote exists we must still provide a non-empty
-          // msg to trigger that split path — otherwise quote is silently dropped
-          // and the server returns code 114.
-          const effectiveCaption = zaloQuote && !(caption ?? '').length
-            ? '↩️'
-            : (caption ?? '');
+          // When no caption, skip the quote — adding a placeholder text just to
+          // carry the quote would create visible noise in the conversation.
+          const effectiveCaption = caption ?? '';
 
           const sendResult = await withTimeout(api.sendMessage(
             {
               msg: effectiveCaption,
               attachments: [localPath],
-              ...(zaloQuote ? { quote: zaloQuote } : {}),
+              ...(effectiveCaption.length && zaloQuote ? { quote: zaloQuote } : {}),
               ...(captionMentions?.length ? { mentions: captionMentions } : {}),
             },
             zaloId,
             threadType,
-          )) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
+          )).catch(async (err: unknown) => {
+            // Code 114 with quote: quote data incompatible with this message type.
+            // Retry without quote so the attachment still goes through.
+            if ((err as { code?: number }).code === 114) {
+              console.warn('[TG→Zalo] code 114 on attachment+quote, retrying without quote');
+              return withTimeout(api.sendMessage(
+                {
+                  msg: effectiveCaption,
+                  attachments: [localPath],
+                  ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+                },
+                zaloId,
+                threadType,
+              ));
+            }
+            throw err;
+          }) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
 
           const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
           if (zaloMsgId !== undefined) {
