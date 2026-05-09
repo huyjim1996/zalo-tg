@@ -634,43 +634,30 @@ export function setupTelegramHandler(
             ),
           ]);
 
-          // Zalo API (code 114) rejects combining attachments + quote in one call.
-          // Strategy: send the file first (with caption), then send a quoted follow-up if needed.
-          if (zaloQuote) {
-            // 1. Send attachment without quote
-            const attResult = await withTimeout(api.sendMessage(
-              {
-                msg: caption ?? '',
-                attachments: [localPath],
-                ...(captionMentions?.length ? { mentions: captionMentions } : {}),
-              },
-              zaloId,
-              threadType,
-            )) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
-            const zaloMsgId = attResult?.message?.msgId ?? attResult?.attachment?.[0]?.msgId;
-            if (zaloMsgId !== undefined) {
-              sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
-            }
-            // 2. Send the quote reference as a separate text message
-            await withTimeout(api.sendMessage(
-              { msg: '', quote: zaloQuote },
-              zaloId,
-              threadType,
-            )).catch(() => undefined); // non-fatal if quote follow-up fails
-          } else {
-            const sendResult = await withTimeout(api.sendMessage(
-              {
-                msg: caption ?? '',
-                attachments: [localPath],
-                ...(captionMentions?.length ? { mentions: captionMentions } : {}),
-              },
-              zaloId,
-              threadType,
-            )) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
-            const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
-            if (zaloMsgId !== undefined) {
-              sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
-            }
+          // zca-js splits internally when msg is non-empty + quote is set:
+          //   1) sends caption+quote as text (reply indicator in Zalo)
+          //   2) sends attachment without quote
+          // When caption is empty but quote exists we must still provide a non-empty
+          // msg to trigger that split path — otherwise quote is silently dropped
+          // and the server returns code 114.
+          const effectiveCaption = zaloQuote && !(caption ?? '').length
+            ? '↩️'
+            : (caption ?? '');
+
+          const sendResult = await withTimeout(api.sendMessage(
+            {
+              msg: effectiveCaption,
+              attachments: [localPath],
+              ...(zaloQuote ? { quote: zaloQuote } : {}),
+              ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+            },
+            zaloId,
+            threadType,
+          )) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
+
+          const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
+          if (zaloMsgId !== undefined) {
+            sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
           }
           console.log(`[TG→Zalo] Send OK: ${filename}`);
         } catch (err) {
