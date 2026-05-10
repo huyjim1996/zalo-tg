@@ -1,9 +1,21 @@
 import 'dotenv/config';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** Root của project (src/../) */
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 function requireEnv(key: string): string {
   const val = process.env[key];
   if (!val) throw new Error(`Missing required environment variable: ${key}`);
   return val;
+}
+
+function resolvePath(envVal: string | undefined, defaultRelative: string): string {
+  const raw = envVal ?? defaultRelative;
+  // Already absolute → use as-is, otherwise resolve from project root
+  return path.isAbsolute(raw) ? raw : path.resolve(PROJECT_ROOT, raw);
 }
 
 export const config = {
@@ -12,7 +24,7 @@ export const config = {
     groupId: Number(requireEnv('TG_GROUP_ID')),
   },
   zalo: {
-    credentialsPath: process.env.ZALO_CREDENTIALS_PATH ?? './credentials.json',
+    credentialsPath: resolvePath(process.env.ZALO_CREDENTIALS_PATH, 'credentials.json'),
   },
-  dataDir: process.env.DATA_DIR ?? './data',
+  dataDir: resolvePath(process.env.DATA_DIR, 'data'),
 } as const;

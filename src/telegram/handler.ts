@@ -157,8 +157,13 @@ export function setupTelegramHandler(
   const setCurrentApi = (api: ZaloAPI) => { currentApi = api; };
 
   tgBot.command('login', async (ctx) => {
-    if (ctx.chat.id !== config.telegram.groupId) return;
-    const threadId = ctx.message.message_thread_id;
+    const isPrivate   = ctx.chat.type === 'private';
+    const isFromGroup = ctx.chat.id === config.telegram.groupId;
+    if (!isPrivate && !isFromGroup) {
+      console.log(`[/login] Bỏ qua từ chat ${ctx.chat.id} (không phải group ${config.telegram.groupId} hoặc DM)`);
+      return;
+    }
+    const threadId = isFromGroup ? ctx.message.message_thread_id : undefined;
     await handleLoginCommand(ctx.chat.id, threadId, (newApi) => {
       currentApi = newApi;
       void onZaloLogin(newApi).catch((e: unknown) => console.error('[/login] onZaloLogin error:', e));

@@ -5,8 +5,10 @@ import { imageSizeFromFile } from 'image-size/fromFile';
 import qrcode from 'qrcode-terminal';
 import { config } from '../config.js';
 import type { ZaloAPI } from './types.js';
+import os from 'os';
+import path from 'path';
 
-const QR_IMAGE_PATH = '/tmp/zalo-qr.png';
+const QR_IMAGE_PATH = path.join(os.tmpdir(), 'zalo-qr.png');
 
 let _api: ZaloAPI | null = null;
 
