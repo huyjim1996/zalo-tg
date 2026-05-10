@@ -5,6 +5,14 @@ import { setupTelegramHandler } from './telegram/handler.js';
 import { config } from './config.js';
 import { startUpdateChecker } from './updater.js';
 
+// ── Global safety net — prevent unhandled rejections from crashing ────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('[Boot] Unhandled rejection (ignored):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Boot] Uncaught exception (ignored):', err);
+});
+
 // ── Boot Zalo (also used when /login swaps in a fresh API) ───────────────────
 
 async function startZalo(api: Awaited<ReturnType<typeof getZaloApi>>): Promise<void> {

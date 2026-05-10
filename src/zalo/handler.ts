@@ -11,6 +11,18 @@ import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyMentionsHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, type ZaloQuoteData } from '../store.js';
+import { tgQueue } from '../utils/tgQueue.js';
+
+// Proxy that routes every tg.* call through the rate-limit queue
+// so 429 errors are auto-retried instead of crashing the process.
+const tg = new Proxy(tgBot.telegram, {
+  get(target, prop: string) {
+    const orig = (target as unknown as Record<string, unknown>)[prop];
+    if (typeof orig !== 'function') return orig;
+    return (...args: unknown[]) =>
+      tgQueue(() => (orig as (...a: unknown[]) => Promise<unknown>).apply(target, args));
+  },
+}) as typeof tgBot.telegram;
 
 // ── Bank card HTML parser ────────────────────────────────────────────────────
 interface BankCardInfo {
@@ -106,7 +118,7 @@ async function getOrCreateTopic(
   const name  = topicName(displayName, type);
   const color = type === ThreadType.Group ? 0xFF93B2 : 0x6FB9F0;
 
-  const topic = await tgBot.telegram.createForumTopic(
+  const topic = await tg.createForumTopic(
     config.telegram.groupId,
     name,
     { icon_color: color },
@@ -121,7 +133,7 @@ async function getOrCreateTopic(
     try {
       const localPath = await downloadToTemp(avatarUrl, `avatar_${Date.now()}.jpg`);
       const stream = createReadStream(localPath);
-      const avatarMsg = await tgBot.telegram.sendPhoto(
+      const avatarMsg = await tg.sendPhoto(
         config.telegram.groupId,
         { source: stream },
         {
@@ -132,7 +144,7 @@ async function getOrCreateTopic(
       );
       await cleanTemp(localPath);
       try {
-        await tgBot.telegram.pinChatMessage(config.telegram.groupId, avatarMsg.message_id, { disable_notification: true });
+        await tg.pinChatMessage(config.telegram.groupId, avatarMsg.message_id, { disable_notification: true });
       } catch { /* pinning requires admin rights */ }
     } catch (avatarErr) {
       console.warn(`[Zalo→TG] Failed to pin group avatar for ${displayName}:`, avatarErr);
@@ -289,7 +301,7 @@ export function setupZaloHandler(api: ZaloAPI): void {
         const tgText = type === ThreadType.Group
           ? formatGroupMsgHtml(senderName, bodyHtml)
           : bodyHtml;
-        const sent = await tgBot.telegram.sendMessage(
+        const sent = await tg.sendMessage(
           config.telegram.groupId,
           tgText,
           { ...tgBase, parse_mode: 'HTML' },
@@ -332,7 +344,7 @@ export function setupZaloHandler(api: ZaloAPI): void {
               const localPath = await downloadToTemp(singleUrl, `photo_${Date.now()}.jpg`);
               const stream = createReadStream(localPath);
               try {
-                const sent = await tgBot.telegram.sendPhoto(
+                const sent = await tg.sendPhoto(
                   config.telegram.groupId,
                   { source: stream },
                   {
@@ -377,10 +389,10 @@ ${escapeHtml(photoCaption)}`
                   media: { source: createReadStream(lp) },
                   ...(i === 0 && captionText ? { caption: captionText, parse_mode: 'HTML' } : {}),
                 }));
-                const sentMsgs = await tgBot.telegram.sendMediaGroup(
+                const sentMsgs = await tg.sendMediaGroup(
                   config.telegram.groupId,
                   mediaItems,
-                  { message_thread_id: buf.topicId } as Parameters<typeof tgBot.telegram.sendMediaGroup>[2],
+                  { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
                 );
                 // Save mapping for first photo (for reply chain)
                 if (sentMsgs.length > 0) {
@@ -415,7 +427,7 @@ ${escapeHtml(photoCaption)}`
         const localPath = await downloadToTemp(url, `doodle_${Date.now()}.jpg`);
         const stream = createReadStream(localPath);
         try {
-          const sent = await tgBot.telegram.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
+          const sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
         } finally { await cleanTemp(localPath); }
         return;
@@ -432,7 +444,7 @@ ${escapeHtml(photoCaption)}`
         const localPath = await downloadToTemp(url, `gif_${Date.now()}${ext}`);
         const stream = createReadStream(localPath);
         try {
-          const sent = await tgBot.telegram.sendAnimation(
+          const sent = await tg.sendAnimation(
             config.telegram.groupId,
             { source: stream },
             tgOpts,
@@ -454,7 +466,7 @@ ${escapeHtml(photoCaption)}`
         const localPath = await downloadToTemp(url, fileName);
         const stream = createReadStream(localPath);
         try {
-          const sent = await tgBot.telegram.sendDocument(
+          const sent = await tg.sendDocument(
             config.telegram.groupId,
             { source: stream, filename: fileName },
             tgOpts,
@@ -471,7 +483,7 @@ ${escapeHtml(photoCaption)}`
         const localPath = await downloadToTemp(url, `video_${Date.now()}.mp4`);
         const stream = createReadStream(localPath);
         try {
-          const sent = await tgBot.telegram.sendVideo(config.telegram.groupId, { source: stream }, tgOpts);
+          const sent = await tg.sendVideo(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
         } finally { await cleanTemp(localPath); }
         return;
@@ -485,7 +497,7 @@ ${escapeHtml(photoCaption)}`
         const localPath = await downloadToTemp(url, `voice_${Date.now()}${ext}`);
         const stream = createReadStream(localPath);
         try {
-          const sent = await tgBot.telegram.sendVoice(config.telegram.groupId, { source: stream }, tgOpts);
+          const sent = await tg.sendVoice(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
         } finally { await cleanTemp(localPath); }
         return;
@@ -515,15 +527,15 @@ ${escapeHtml(photoCaption)}`
             try {
               // Try native TG sticker (webp ≤512 KB displays as a proper sticker)
               const stream = createReadStream(localPath);
-              sent = await tgBot.telegram.sendSticker(
+              sent = await tg.sendSticker(
                 config.telegram.groupId,
                 { source: stream },
-                tgBase as Parameters<typeof tgBot.telegram.sendSticker>[2],
+                tgBase as Parameters<typeof tg.sendSticker>[2],
               );
             } catch {
               // Fall back to photo if file is too large or format unsupported
               const stream = createReadStream(localPath);
-              sent = await tgBot.telegram.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
+              sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
             }
             saveTgMapping(sent);
           } finally { await cleanTemp(localPath); }
@@ -541,7 +553,7 @@ ${escapeHtml(photoCaption)}`
         const linkText = type === ThreadType.Group
           ? `${groupCaption(senderName)}\n<a href="${href}">${title}</a>`
           : `<a href="${href}">${title}</a>`;
-        const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, linkText, {
+        const sent = await tg.sendMessage(config.telegram.groupId, linkText, {
           ...tgBase,
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: false },
@@ -576,7 +588,7 @@ ${escapeHtml(photoCaption)}`
                 const fullCaption = type === ThreadType.Group
                   ? `${groupCaption(senderName)}\n${caption}`
                   : caption;
-                const sent = await tgBot.telegram.sendPhoto(
+                const sent = await tg.sendPhoto(
                   config.telegram.groupId,
                   { source: qrBuf },
                   { ...tgBase, caption: fullCaption, parse_mode: 'HTML' },
@@ -614,7 +626,7 @@ ${escapeHtml(photoCaption)}`
         const icon = ACTION_ICONS[media.action ?? ''] ?? '📋';
         const body = `${icon} ${label}`;
         const text = type === ThreadType.Group ? `${groupCaption(senderName)}\n${body}` : body;
-        const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, text, {
+        const sent = await tg.sendMessage(config.telegram.groupId, text, {
           ...tgBase,
           parse_mode: 'HTML',
         });
@@ -634,15 +646,15 @@ ${escapeHtml(photoCaption)}`
 
         if (lat !== undefined && lng !== undefined) {
           // Send as native TG location — shows map preview with Maps button
-          const sent = await tgBot.telegram.sendLocation(
+          const sent = await tg.sendLocation(
             config.telegram.groupId,
             lat,
             lng,
-            { ...tgBase } as Parameters<typeof tgBot.telegram.sendLocation>[3],
+            { ...tgBase } as Parameters<typeof tg.sendLocation>[3],
           );
           if (type === ThreadType.Group) {
             // Send sender name as a follow-up caption since sendLocation has no HTML caption
-            await tgBot.telegram.sendMessage(
+            await tg.sendMessage(
               config.telegram.groupId,
               `${groupCaption(senderName)}📍 Vị trí`,
               { ...tgBase, parse_mode: 'HTML' },
@@ -654,7 +666,7 @@ ${escapeHtml(photoCaption)}`
           const mapsUrl = media.href || '#';
           const body    = `📍 <a href="${mapsUrl}">Vị trí</a>`;
           const text    = type === ThreadType.Group ? `${groupCaption(senderName)}\n${body}` : body;
-          const sent    = await tgBot.telegram.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
+          const sent    = await tg.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
           saveTgMapping(sent);
         }
         return;
@@ -703,7 +715,7 @@ ${escapeHtml(photoCaption)}`
             const text = type === ThreadType.Group
               ? `${groupCaption(senderName)}📊 <b>${escapeHtml(question)}</b>\n<i>Cuộc bình chọn mới (${options.length} lựa chọn)</i>`
               : `📊 <b>${escapeHtml(question)}</b>`;
-            const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
+            const sent = await tg.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
             saveTgMapping(sent);
             return;
           }
@@ -712,7 +724,7 @@ ${escapeHtml(photoCaption)}`
             ? `${senderName} tạo bình chọn`
             : 'Bình chọn mới';
 
-          const tgPollMsg = await tgBot.telegram.sendPoll(
+          const tgPollMsg = await tg.sendPoll(
             config.telegram.groupId,
             question,
             options.map(o => o.content),
@@ -721,12 +733,12 @@ ${escapeHtml(photoCaption)}`
               is_anonymous:        isAnonymous,
               allows_multiple_answers: pollDetail?.allow_multi_choices ?? false,
               question_parse_mode: undefined,
-            } as Parameters<typeof tgBot.telegram.sendPoll>[3],
+            } as Parameters<typeof tg.sendPoll>[3],
           );
 
           // Send editable score message below
           const scoreText = buildScoreText(header, pollDetail?.options ?? [], pollDetail?.closed ?? false);
-          const tgScoreMsg = await tgBot.telegram.sendMessage(
+          const tgScoreMsg = await tg.sendMessage(
             config.telegram.groupId,
             scoreText,
             { message_thread_id: topicId, parse_mode: 'HTML' },
@@ -761,7 +773,7 @@ ${escapeHtml(photoCaption)}`
 
           if (existingEntry) {
             try {
-              await tgBot.telegram.editMessageText(
+              await tg.editMessageText(
                 config.telegram.groupId,
                 existingEntry.tgScoreMsgId,
                 undefined,
@@ -776,7 +788,7 @@ ${escapeHtml(photoCaption)}`
               console.log(`[ZaloHandler] Poll ${pollId} score message edited OK`);
             } catch (editErr) {
               console.warn(`[ZaloHandler] Poll ${pollId} edit failed, sending new:`, editErr);
-              const newScore = await tgBot.telegram.sendMessage(
+              const newScore = await tg.sendMessage(
                 config.telegram.groupId,
                 scoreText,
                 { message_thread_id: existingEntry.tgThreadId, parse_mode: 'HTML',
@@ -786,7 +798,7 @@ ${escapeHtml(photoCaption)}`
             }
           } else {
             // existingEntry lost (bot restarted) — just send score as standalone message
-            const sent = await tgBot.telegram.sendMessage(
+            const sent = await tg.sendMessage(
               config.telegram.groupId,
               scoreText,
               { ...tgBase, parse_mode: 'HTML' },
@@ -833,7 +845,7 @@ ${escapeHtml(photoCaption)}`
             try {
               const localPath = await downloadToTemp(qrUrl, `qr_${Date.now()}.jpg`);
               const stream = createReadStream(localPath);
-              const sent = await tgBot.telegram.sendPhoto(
+              const sent = await tg.sendPhoto(
                 config.telegram.groupId,
                 { source: stream },
                 { ...tgBase, caption: fullText, parse_mode: 'HTML' },
@@ -841,11 +853,11 @@ ${escapeHtml(photoCaption)}`
               saveTgMapping(sent);
               await cleanTemp(localPath);
             } catch {
-              const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, fullText, { ...tgBase, parse_mode: 'HTML' });
+              const sent = await tg.sendMessage(config.telegram.groupId, fullText, { ...tgBase, parse_mode: 'HTML' });
               saveTgMapping(sent);
             }
           } else {
-            const sent = await tgBot.telegram.sendMessage(config.telegram.groupId, fullText, { ...tgBase, parse_mode: 'HTML' });
+            const sent = await tg.sendMessage(config.telegram.groupId, fullText, { ...tgBase, parse_mode: 'HTML' });
             saveTgMapping(sent);
           }
           return;
@@ -856,7 +868,7 @@ ${escapeHtml(photoCaption)}`
       const fallback = type === ThreadType.Group
         ? `${groupCaption(senderName)}\n<i>[${msgType}]</i>`
         : `<i>[${msgType}]</i>`;
-      const sentFallback = await tgBot.telegram.sendMessage(config.telegram.groupId, fallback, {
+      const sentFallback = await tg.sendMessage(config.telegram.groupId, fallback, {
         ...tgBase,
         parse_mode: 'HTML',
       });
@@ -888,11 +900,11 @@ ${escapeHtml(photoCaption)}`
       if (topicId === undefined) return;
 
       // Delete the forwarded TG message
-      await tgBot.telegram.deleteMessage(config.telegram.groupId, tgMsgId);
+      await tg.deleteMessage(config.telegram.groupId, tgMsgId);
       console.log(`[ZaloHandler] Undo: deleted TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
 
       // Notify in topic
-      await tgBot.telegram.sendMessage(
+      await tg.sendMessage(
         config.telegram.groupId,
         `<i>🗑 Tin nhắn đã được thu hồi</i>`,
         { message_thread_id: topicId, parse_mode: 'HTML' },
@@ -980,7 +992,7 @@ ${escapeHtml(photoCaption)}`
       }
 
       // Send reaction emoji as a reply to the forwarded TG message
-      await tgBot.telegram.sendMessage(
+      await tg.sendMessage(
         config.telegram.groupId,
         `${emoji} <b>${escapeHtml(dName)}</b>`,
         {
@@ -1024,7 +1036,7 @@ ${escapeHtml(photoCaption)}`
               const scoreText = buildScoreText(header, detail.options, detail.closed ?? false);
               console.log(`[ZaloHandler] Poll ${pollId} update:`, detail.options.map((o: { content: string; votes: number }) => `${o.content}=${o.votes}`).join(', '));
               try {
-                await tgBot.telegram.editMessageText(
+                await tg.editMessageText(
                   config.telegram.groupId,
                   entry.tgScoreMsgId,
                   undefined,
@@ -1037,7 +1049,7 @@ ${escapeHtml(photoCaption)}`
                   },
                 );
               } catch {
-                const newScore = await tgBot.telegram.sendMessage(
+                const newScore = await tg.sendMessage(
                   config.telegram.groupId,
                   scoreText,
                   { message_thread_id: entry.tgThreadId, parse_mode: 'HTML',
@@ -1081,7 +1093,7 @@ ${escapeHtml(photoCaption)}`
 
       if (!notifText) return;
 
-      await tgBot.telegram.sendMessage(
+      await tg.sendMessage(
         config.telegram.groupId,
         `<i>${notifText}</i>`,
         { message_thread_id: topicId, parse_mode: 'HTML' },
