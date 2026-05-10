@@ -963,6 +963,22 @@ ${escapeHtml(photoCaption)}`
 
       const dName = data?.dName ?? data?.uidFrom ?? 'ai đó';
 
+      // Auto mirror reaction in DM conversations only
+      if (type === 0) {
+        try {
+          await api.addReaction(
+            rIcon as import('zca-js').Reactions,
+            {
+              data: { msgId: zaloMsgId, cliMsgId: '' },
+              threadId: String(zaloId),
+              type: 0,
+            },
+          );
+        } catch (err) {
+          console.warn('[ZaloHandler] Auto-react failed:', err);
+        }
+      }
+
       // Send reaction emoji as a reply to the forwarded TG message
       await tgBot.telegram.sendMessage(
         config.telegram.groupId,
