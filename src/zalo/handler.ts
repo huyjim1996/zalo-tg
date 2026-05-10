@@ -165,11 +165,24 @@ async function _doCreateTopic(
   const name  = topicName(displayName, type);
   const color = type === ThreadType.Group ? 0xFF93B2 : 0x6FB9F0;
 
-  const topic = await tg.createForumTopic(
-    config.telegram.groupId,
-    name,
-    { icon_color: color },
-  );
+  let topic: { message_thread_id: number };
+  try {
+    topic = await tg.createForumTopic(
+      config.telegram.groupId,
+      name,
+      { icon_color: color },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('not enough rights') || msg.includes('TOPIC_') || msg.includes('rights to manage')) {
+      console.error(`[Zalo→TG] Cannot create topic — bot lacks "Manage Topics" admin right. Falling back to General topic.`);
+      // Use topic ID 1 (General) as fallback so messages still get delivered
+      const fallbackId = 1;
+      store.set({ topicId: fallbackId, zaloId, type, name: displayName });
+      return fallbackId;
+    }
+    throw err;
+  }
 
   const topicId = topic.message_thread_id;
   store.set({ topicId, zaloId, type, name: displayName });
