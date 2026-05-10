@@ -3,6 +3,7 @@ import { setupZaloHandler } from './zalo/handler.js';
 import { tgBot } from './telegram/bot.js';
 import { setupTelegramHandler } from './telegram/handler.js';
 import { config } from './config.js';
+import { startUpdateChecker } from './updater.js';
 
 // ── Boot Zalo (also used when /login swaps in a fresh API) ───────────────────
 
@@ -63,6 +64,9 @@ async function main(): Promise<void> {
   });
 
   console.log('[Boot] Bridge is running 🚀  (Ctrl+C to stop)');
+
+  // ── Auto update checker ────────────────────────────────────────────────────
+  startUpdateChecker(tgBot);
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
   const shutdown = (signal: string) => {
