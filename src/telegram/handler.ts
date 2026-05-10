@@ -428,6 +428,201 @@ export function setupTelegramHandler(
     );
   });
 
+  // ── /addfriend <số điện thoại> ─────────────────────────────────────────────
+  tgBot.command('addfriend', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+    if (!currentApi) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối', replyOpts);
+      return;
+    }
+
+    const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+    const phone = text.split(/\s+/)[1]?.replace(/[^0-9+]/g, '');
+    if (!phone) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Dùng: <code>/addfriend &lt;số điện thoại&gt;</code>\nVí dụ: <code>/addfriend 0912345678</code>',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    try {
+      const user = await currentApi.findUser(phone) as {
+        uid?: string; display_name?: string; zalo_name?: string; avatar?: string;
+        globalId?: string;
+      } | undefined;
+
+      if (!user?.uid) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `❌ Không tìm thấy người dùng với SĐT <code>${phone}</code>`,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+
+      const name = user.display_name ?? user.zalo_name ?? `UID ${user.uid}`;
+      const status = await currentApi.getFriendRequestStatus(user.uid) as {
+        is_friend?: number; is_requested?: number; is_requesting?: number;
+      } | undefined;
+
+      let statusLine = '';
+      if (status?.is_friend) statusLine = '✅ Đã là bạn bè';
+      else if (status?.is_requesting) statusLine = '⏳ Đang chờ họ chấp nhận';
+      else if (status?.is_requested) statusLine = '📩 Họ đang chờ bạn chấp nhận';
+
+      const keyboard = statusLine ? [] : [[{
+        text: `➕ Kết bạn với ${name}`,
+        callback_data: `af:${user.uid}`,
+      }]];
+
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `👤 <b>${name}</b>\n📱 ${phone}${statusLine ? `\n${statusLine}` : ''}`,
+        {
+          ...replyOpts,
+          parse_mode: 'HTML',
+          ...(keyboard.length ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+        },
+      );
+    } catch (err) {
+      console.error('[/addfriend]', err);
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Lỗi tìm kiếm người dùng.', replyOpts);
+    }
+  });
+
+  // ── /friendrequests ────────────────────────────────────────────────────────
+  tgBot.command('friendrequests', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+    if (!currentApi) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối', replyOpts);
+      return;
+    }
+
+    try {
+      // Lời mời nhóm đang chờ
+      const [sentReqs, groupInvites] = await Promise.all([
+        currentApi.getSentFriendRequest() as Promise<Record<string, {
+          zaloName: string; displayName: string; fReqInfo: { message: string; time: number };
+        }>>,
+        currentApi.getGroupInviteBoxList({ invPerPage: 20 }) as Promise<{
+          invitations: Array<{
+            groupInfo: { groupId: string; name: string; totalMember: number };
+            inviterInfo: { dName: string };
+            expiredTs: string;
+          }>;
+          total: number;
+        }>,
+      ]);
+
+      const parts: string[] = [];
+
+      // Lời mời kết bạn đã gửi
+      const sentList = Object.values(sentReqs ?? {});
+      if (sentList.length > 0) {
+        parts.push(`📤 <b>Lời mời kết bạn đã gửi (${sentList.length})</b>`);
+        for (const u of sentList.slice(0, 15)) {
+          const name = u.displayName || u.zaloName;
+          const msg  = u.fReqInfo?.message ? ` — "${u.fReqInfo.message}"` : '';
+          parts.push(`• ${name}${msg}`);
+        }
+      }
+
+      // Lời mời tham gia nhóm
+      const invites = groupInvites?.invitations ?? [];
+      if (invites.length > 0) {
+        parts.push(`\n📬 <b>Lời mời tham gia nhóm (${invites.length})</b>`);
+        const groupButtons: Array<[{ text: string; callback_data: string }]> = [];
+        for (const inv of invites.slice(0, 15)) {
+          const g   = inv.groupInfo;
+          const exp = new Date(Number(inv.expiredTs) * 1000).toLocaleDateString('vi-VN');
+          parts.push(`• 👥 <b>${g.name}</b> (${g.totalMember} TV)\n  Mời bởi: ${inv.inviterInfo.dName} · HH: ${exp}`);
+          groupButtons.push([{
+            text: `✅ Tham gia ${g.name}`,
+            callback_data: `jgi:${g.groupId}`,
+          }]);
+        }
+
+        if (parts.length === 0) parts.push('✅ Không có lời mời nào đang chờ.');
+
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          parts.join('\n'),
+          { ...replyOpts, parse_mode: 'HTML', reply_markup: { inline_keyboard: groupButtons } },
+        );
+        return;
+      }
+
+      if (parts.length === 0) parts.push('✅ Không có lời mời nào đang chờ.');
+      await ctx.telegram.sendMessage(config.telegram.groupId, parts.join('\n'), { ...replyOpts, parse_mode: 'HTML' });
+    } catch (err) {
+      console.error('[/friendrequests]', err);
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Lỗi lấy danh sách lời mời.', replyOpts);
+    }
+  });
+
+  // ── /joingroup <link> ──────────────────────────────────────────────────────
+  tgBot.command('joingroup', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+    if (!currentApi) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối', replyOpts);
+      return;
+    }
+
+    const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+    const link = text.split(/\s+/)[1]?.trim();
+    if (!link) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Dùng: <code>/joingroup &lt;link nhóm Zalo&gt;</code>',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    try {
+      // Thử lấy info link trước
+      const linkInfo = await currentApi.getGroupLinkInfo(link) as {
+        groupInfo?: { name?: string; totalMember?: number };
+      } | undefined;
+
+      const groupName = linkInfo?.groupInfo?.name;
+      const totalMember = linkInfo?.groupInfo?.totalMember;
+
+      await currentApi.joinGroupLink(link);
+
+      const memberText = totalMember ? ` (${totalMember} TV)` : '';
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        groupName
+          ? `✅ Đã tham gia nhóm <b>${groupName}</b>${memberText}!`
+          : '✅ Đã gửi yêu cầu tham gia nhóm thành công!',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      // Invalidate group cache
+      groupsCache.set([]);
+    } catch (err) {
+      console.error('[/joingroup]', err);
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Không thể tham gia nhóm. Link có thể đã hết hạn hoặc không hợp lệ.', replyOpts);
+    }
+  });
+
   tgBot.on('callback_query', async (ctx) => {
     const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
 
@@ -444,6 +639,37 @@ export function setupTelegramHandler(
       } catch (err) {
         console.error('[TG→Zalo] lock_poll callback error:', err);
         try { await ctx.answerCbQuery('❌ Lỗi khoá bình chọn'); } catch { /* ignore */ }
+      }
+      return;
+    }
+
+    // ── af: send friend request ──────────────────────────────────────────────
+    if (data?.startsWith('af:')) {
+      const userId = data.slice(3);
+      if (!currentApi) { await ctx.answerCbQuery('❌ Zalo chưa kết nối'); return; }
+      try {
+        await currentApi.sendFriendRequest('Xin chào! Mình muốn kết bạn với bạn 😊', userId);
+        await ctx.answerCbQuery('✅ Đã gửi lời mời kết bạn!');
+        await ctx.editMessageReplyMarkup(undefined);
+      } catch (err) {
+        console.error('[cb/af]', err);
+        await ctx.answerCbQuery('❌ Gửi lời mời thất bại');
+      }
+      return;
+    }
+
+    // ── jgi: join group from invite box ─────────────────────────────────────
+    if (data?.startsWith('jgi:')) {
+      const groupId = data.slice(4);
+      if (!currentApi) { await ctx.answerCbQuery('❌ Zalo chưa kết nối'); return; }
+      try {
+        await currentApi.joinGroupInviteBox(groupId);
+        await ctx.answerCbQuery('✅ Đã tham gia nhóm!');
+        await ctx.editMessageReplyMarkup(undefined);
+        groupsCache.set([]);
+      } catch (err) {
+        console.error('[cb/jgi]', err);
+        await ctx.answerCbQuery('❌ Không thể tham gia nhóm');
       }
       return;
     }
