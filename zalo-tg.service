@@ -1,0 +1,32 @@
+[Unit]
+Description=Zalo-Telegram Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/zalo-tg
+
+# Build trước khi chạy, dùng compiled JS (không cần tsx)
+ExecStartPre=/usr/bin/npm run build
+ExecStart=/usr/bin/node dist/index.js
+
+# Tự restart nếu crash, chờ 5s giữa các lần
+Restart=on-failure
+RestartSec=5
+
+# Giới hạn restart loop (không restart nếu crash > 5 lần / 60s)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Biến môi trường (hoặc dùng EnvironmentFile nếu có .env)
+EnvironmentFile=/root/zalo-tg/.env
+
+# Log ra journal (xem bằng: journalctl -u zalo-tg -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zalo-tg
+
+[Install]
+WantedBy=multi-user.target
