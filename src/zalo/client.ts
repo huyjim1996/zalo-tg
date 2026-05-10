@@ -17,6 +17,7 @@ let _api: ZaloAPI | null = null;
 const ZALO_OPTIONS = {
   logging:      false,
   checkUpdate:  false,
+  selfListen:   true,
   imageMetadataGetter: async (filePath: string) => {
     try {
       const { width, height } = await imageSizeFromFile(filePath);

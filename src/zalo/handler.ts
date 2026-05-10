@@ -193,7 +193,14 @@ export function setupZaloHandler(api: ZaloAPI): void {
 
   api.listener.on('message', async (msg: ZaloMessage) => {
     try {
-      if (msg.isSelf) return;
+      const selfMsgIds = [msg.data.msgId, msg.data.realMsgId]
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+      const isTelegramEcho = msg.isSelf
+        && selfMsgIds.some((id) => sentMsgStore.getByZaloMsgId(String(id)) !== undefined);
+      if (isTelegramEcho) {
+        console.log(`[Zalo→TG] Skip TG echo (${selfMsgIds.join(', ')})`);
+        return;
+      }
 
       const zaloId     = msg.threadId;
       const type       = msg.type as 0 | 1;
