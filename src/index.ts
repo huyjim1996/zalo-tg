@@ -1,6 +1,6 @@
 import { getZaloApi } from './zalo/client.js';
 import { setupZaloHandler } from './zalo/handler.js';
-import { tgBot } from './telegram/bot.js';
+import { tgBot, syncTelegramCommands } from './telegram/bot.js';
 import { setupTelegramHandler } from './telegram/handler.js';
 import { config } from './config.js';
 import { startUpdateChecker } from './updater.js';
@@ -42,6 +42,10 @@ async function main(): Promise<void> {
   // The second argument callback fires once getMe() + deleteWebhook() succeed.
   tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
     console.log('[Boot] Telegram bot started ✓');
+
+    syncTelegramCommands()
+      .then(() => console.log('[Boot] Telegram command menu synced ✓'))
+      .catch((err: unknown) => console.warn('[Boot] Failed to sync Telegram commands:', err));
 
     // ── Attempt Zalo login in background ────────────────────────────────────
     // If credentials.json exists → connects automatically and updates currentApi.

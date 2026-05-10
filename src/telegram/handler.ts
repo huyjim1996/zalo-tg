@@ -66,6 +66,23 @@ function resolveTgMentions(
   return result;
 }
 
+function normalizePhoneSearchQuery(query: string): string | null {
+  const trimmed = query.trim();
+  if (!trimmed) return null;
+  if (!/^[+()\d.\s-]+$/.test(trimmed)) return null;
+
+  const digitsOnly = trimmed.replace(/\D/g, '');
+  if (digitsOnly.length < 9 || digitsOnly.length > 15) return null;
+
+  return digitsOnly;
+}
+
+function buildTopicUrl(topicId: number): string {
+  const chatId = String(config.telegram.groupId);
+  const internalChatId = chatId.startsWith('-100') ? chatId.slice(4) : chatId.replace(/^-/, '');
+  return `https://t.me/c/${internalChatId}/${topicId}`;
+}
+
 /** Track in-progress QR login so we don't stack multiple flows. */
 let qrLoginInProgress = false;
 
@@ -286,17 +303,66 @@ export function setupTelegramHandler(
       : undefined;
     const replyOpts = threadId ? { message_thread_id: threadId } : {};
 
-    const query = (ctx.message.text ?? '').replace(/^\/search\s*/i, '').trim();
+    const query = (ctx.message.text ?? '').replace(/^\/search(?:@[A-Za-z0-9_]+)?\s*/i, '').trim();
     if (!query) {
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        '🔍 Cú pháp: <code>/search Tên</code>\nTìm kiếm cả bạn bè lẫn nhóm Zalo.',
+        '🔍 Cú pháp: <code>/search Tên hoặc số điện thoại</code>\nHỗ trợ cả <code>/search ...</code> lẫn <code>/search@zalo_tele_bridge_bot ...</code>.\nVí dụ số: <code>094.495.3545</code> hoặc <code>094 593 5345</code>.',
         { ...replyOpts, parse_mode: 'HTML' },
       );
       return;
     }
 
     if (!currentApi) { await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối', replyOpts); return; }
+
+    const phoneQuery = normalizePhoneSearchQuery(query);
+    if (phoneQuery) {
+      try {
+        const user = await currentApi.findUser(phoneQuery) as {
+          uid?: string;
+          display_name?: string;
+          zalo_name?: string;
+        } | undefined;
+
+        if (!user?.uid) {
+          await ctx.telegram.sendMessage(
+            config.telegram.groupId,
+            `🔍 Không tìm thấy tài khoản Zalo cho số <b>${phoneQuery}</b>.`,
+            { ...replyOpts, parse_mode: 'HTML' },
+          );
+          return;
+        }
+
+        const displayName = user.display_name || user.zalo_name || `Zalo ${user.uid}`;
+        const existingTopicId = store.getTopicByZalo(user.uid, 0);
+        const button: { text: string; callback_data: string } | { text: string; url: string } = existingTopicId !== undefined
+          ? { text: `👤 ${displayName} ✅`, url: buildTopicUrl(existingTopicId) }
+          : { text: `👤 ${displayName}`, callback_data: `sc:${user.uid}` };
+
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `📱 Tìm thấy theo số <b>${phoneQuery}</b>:
+
+✅ = đã có topic • Nhấn để mở nếu đã map, hoặc tạo nếu chưa có`,
+          {
+            ...replyOpts,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [[button]],
+            },
+          },
+        );
+        return;
+      } catch (err) {
+        console.error('[/search] findUser failed:', err);
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `❌ Lỗi tìm số điện thoại <b>${phoneQuery}</b>: ${err instanceof Error ? err.message : String(err)}`,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+    }
 
     // Refresh friends cache if stale
     if (!friendsCache.isFresh()) {
@@ -343,20 +409,26 @@ export function setupTelegramHandler(
       return;
     }
 
-    const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+    const buttons: Array<Array<{ text: string; callback_data: string } | { text: string; url: string }>> = [];
     for (const f of friendResults) {
-      const hasMap = store.getTopicByZalo(f.userId, 0) !== undefined;
-      buttons.push([{ text: `👤 ${f.displayName}${hasMap ? ' ✅' : ''}`, callback_data: `sc:${f.userId}` }]);
+      const existingTopicId = store.getTopicByZalo(f.userId, 0);
+      const row: Array<{ text: string; callback_data: string } | { text: string; url: string }> = [existingTopicId !== undefined
+        ? { text: `👤 ${f.displayName} ✅`, url: buildTopicUrl(existingTopicId) }
+        : { text: `👤 ${f.displayName}`, callback_data: `sc:${f.userId}` }];
+      buttons.push(row);
     }
     for (const g of groupResults) {
-      const hasMap = store.getTopicByZalo(g.groupId, 1) !== undefined;
-      buttons.push([{ text: `👥 ${g.name} (${g.totalMember} TV)${hasMap ? ' ✅' : ''}`, callback_data: `sg:${g.groupId}` }]);
+      const existingTopicId = store.getTopicByZalo(g.groupId, 1);
+      const row: Array<{ text: string; callback_data: string } | { text: string; url: string }> = [existingTopicId !== undefined
+        ? { text: `👥 ${g.name} (${g.totalMember} TV) ✅`, url: buildTopicUrl(existingTopicId) }
+        : { text: `👥 ${g.name} (${g.totalMember} TV)`, callback_data: `sg:${g.groupId}` }];
+      buttons.push(row);
     }
 
     const parts: string[] = [`🔍 Kết quả "<b>${query}</b>":`, ''];
     if (friendResults.length > 0) parts.push(`👤 <b>Bạn bè</b> (${friendResults.length}):`);
     if (groupResults.length > 0)  parts.push(`👥 <b>Nhóm</b> (${groupResults.length}):`);
-    parts.push('', '✅ = đã có topic • Nhấn để tạo topic');
+    parts.push('', '✅ = đã có topic • Nhấn để mở nếu đã map, hoặc tạo nếu chưa có');
 
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
@@ -768,10 +840,20 @@ export function setupTelegramHandler(
     const existing = store.getTopicByZalo(entityId, threadType);
     if (existing !== undefined) {
       await ctx.answerCbQuery('ℹ️ Topic đã tồn tại');
+      const currentThreadId = 'message' in ctx.callbackQuery && ctx.callbackQuery.message && 'message_thread_id' in ctx.callbackQuery.message
+        ? (ctx.callbackQuery.message.message_thread_id as number | undefined)
+        : undefined;
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        `💬 Topic cho ${isGroup ? 'nhóm' : 'người'} này đã có sẵn.`,
-        { message_thread_id: existing },
+        `💬 Topic cho ${isGroup ? 'nhóm' : 'người'} này đã có sẵn. Nhấn nút bên dưới để mở.`,
+        {
+          ...(currentThreadId ? { message_thread_id: currentThreadId } : {}),
+          reply_markup: {
+            inline_keyboard: [[
+              { text: 'Mở topic', url: buildTopicUrl(existing) },
+            ]],
+          },
+        },
       );
       return;
     }
