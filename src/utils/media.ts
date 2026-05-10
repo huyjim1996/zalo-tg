@@ -60,6 +60,27 @@ export async function convertToM4a(inputPath: string): Promise<string> {
   return outputPath;
 }
 
+/**
+ * Extract the first frame of a video as a JPEG thumbnail.
+ * Returns the path to the thumbnail file (caller must clean it up).
+ */
+export async function extractVideoThumbnail(videoPath: string): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const outputPath = path.join(TMP_DIR, `thumb_${Date.now()}.jpg`);
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y', '-i', videoPath,
+      '-vframes', '1',
+      '-q:v', '5',    // quality 1-31, lower=better; 5 is ~90% JPEG
+      '-vf', 'scale=\'min(720,iw)\':-2',  // max 720px wide, keep aspect
+      outputPath,
+    ]);
+    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg thumb exit ${code}`)));
+    ff.on('error', reject);
+  });
+  return outputPath;
+}
+
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv']);
 

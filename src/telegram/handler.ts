@@ -6,7 +6,7 @@ import type { ZaloAPI } from '../zalo/types.js';
 import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
-import { downloadToTemp, cleanTemp, convertToM4a } from '../utils/media.js';
+import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
 
 // ── Mention resolution helper ──────────────────────────────────────────────
@@ -1304,7 +1304,7 @@ export function setupTelegramHandler(
 
       if ('video' in msg && msg.video) {
         const vid   = msg.video;
-        const fname = vid.file_name ?? `video_${Date.now()}.mp4`;
+        const fname = vid.file_name?.endsWith('.mp4') ? vid.file_name : `video_${Date.now()}.mp4`;
         const { cap, capMentions } = getCaptionMentions();
         const mediaGroupId = ('media_group_id' in msg ? (msg as { media_group_id?: string }).media_group_id : undefined);
         if (mediaGroupId) {
@@ -1317,7 +1317,77 @@ export function setupTelegramHandler(
           );
           return;
         }
-        await sendAttachment(vid.file_id, fname, vid.file_size, cap, capMentions);
+
+        // Download video → upload to Zalo CDN → send as inline playable video
+        if ((vid.file_size ?? 0) > TG_FILE_LIMIT) {
+          await notifyTooBig(fname, vid.file_size);
+          return;
+        }
+        let fileLink: URL;
+        try { fileLink = await ctx.telegram.getFileLink(vid.file_id); }
+        catch (err: unknown) {
+          const isTooBig = err instanceof Error && err.message.includes('file is too big');
+          if (isTooBig) { await notifyTooBig(fname, vid.file_size); return; }
+          throw err;
+        }
+        const localVideoPath = await downloadToTemp(fileLink.toString(), fname);
+        let localThumbPath: string | undefined;
+        try {
+          // Extract first frame as thumbnail
+          try { localThumbPath = await extractVideoThumbnail(localVideoPath); } catch { /* no thumb */ }
+
+          // Upload video to Zalo CDN
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const videoUploads: any[] = await api.uploadAttachment([localVideoPath], zaloId, threadType);
+          const videoUpload = videoUploads?.find((r: { fileType?: string }) => r.fileType === 'video') as
+            { fileUrl?: string } | undefined;
+
+          if (!videoUpload?.fileUrl) {
+            // Fallback: send as file attachment
+            await sendAttachment(vid.file_id, fname, vid.file_size, cap, capMentions);
+            return;
+          }
+
+          // Upload thumbnail image to Zalo CDN
+          let thumbUrl = videoUpload.fileUrl; // worst-case: same URL (shows broken thumb but video works)
+          if (localThumbPath) {
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const thumbUploads: any[] = await api.uploadAttachment([localThumbPath], zaloId, threadType);
+              const tu = thumbUploads?.[0] as { normalUrl?: string } | undefined;
+              if (tu?.normalUrl) thumbUrl = tu.normalUrl;
+            } catch { /* keep fallback thumbUrl */ }
+          }
+
+          sentMsgStore.markSending(zaloId);
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const result = await (api.sendVideo as (...a: any[]) => Promise<{ msgId?: number }>)(
+              {
+                videoUrl:     videoUpload.fileUrl,
+                thumbnailUrl: thumbUrl,
+                width:        vid.width,
+                height:       vid.height,
+                duration:     (vid.duration ?? 0) * 1000,
+                msg:          cap ?? '',
+              },
+              zaloId,
+              threadType,
+            );
+            if (result?.msgId !== undefined) {
+              sentMsgStore.save(msg.message_id, { msgId: result.msgId, zaloId, threadType });
+            }
+          } finally {
+            sentMsgStore.unmarkSending(zaloId);
+          }
+        } catch (err) {
+          console.error('[TG→Zalo] sendVideo failed, fallback to attachment:', err);
+          // Fallback: send as regular file
+          try { await sendAttachment(vid.file_id, fname, vid.file_size, cap, capMentions); } catch { /* ignore */ }
+        } finally {
+          await cleanTemp(localVideoPath);
+          if (localThumbPath) await cleanTemp(localThumbPath);
+        }
         return;
       }
 
