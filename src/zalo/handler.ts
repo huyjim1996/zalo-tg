@@ -129,12 +129,36 @@ async function getCachedGroupInfo(
   } catch { return {}; }
 }
 
+// In-flight topic creation promises — prevents duplicate topic creation when
+// many messages arrive concurrently for the same conversation (e.g. 20-photo album).
+const _pendingTopics = new Map<string, Promise<number>>();
+
 async function getOrCreateTopic(
   zaloId: string,
   type: 0 | 1,
   displayName: string,
   avatarUrl?: string,
 ): Promise<number> {
+  const existing = store.getTopicByZalo(zaloId, type);
+  if (existing !== undefined) return existing;
+
+  const pendingKey = `${type}:${zaloId}`;
+  const inFlight = _pendingTopics.get(pendingKey);
+  if (inFlight) return inFlight;
+
+  const promise = _doCreateTopic(zaloId, type, displayName, avatarUrl)
+    .finally(() => _pendingTopics.delete(pendingKey));
+  _pendingTopics.set(pendingKey, promise);
+  return promise;
+}
+
+async function _doCreateTopic(
+  zaloId: string,
+  type: 0 | 1,
+  displayName: string,
+  avatarUrl?: string,
+): Promise<number> {
+  // Re-check after acquiring "lock" — another concurrent call may have finished
   const existing = store.getTopicByZalo(zaloId, type);
   if (existing !== undefined) return existing;
 
