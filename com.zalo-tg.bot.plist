@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zalo-tg.bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/Users/wica/lq/zalo-tg/dist/index.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/wica/lq/zalo-tg</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+
+    <!-- Tự restart nếu crash -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Chạy ngay khi load (không cần login) -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Log stdout/stderr ra file -->
+    <key>StandardOutPath</key>
+    <string>/Users/wica/lq/zalo-tg/logs/bot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/wica/lq/zalo-tg/logs/bot.error.log</string>
+</dict>
+</plist>

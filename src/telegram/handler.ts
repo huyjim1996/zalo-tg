@@ -623,6 +623,55 @@ export function setupTelegramHandler(
     }
   });
 
+  // ── /leavegroup ─────────────────────────────────────────────────────────────
+  // Phải gửi trong topic của nhóm muốn rời. Hiển thị confirm button.
+  tgBot.command('leavegroup', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+    if (!threadId) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Hãy gửi lệnh này <b>trong topic của nhóm</b> muốn rời.',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const entry = store.getEntryByTopic(threadId);
+    if (!entry || entry.type !== 1) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '❌ Topic này không phải nhóm Zalo.',
+        replyOpts,
+      );
+      return;
+    }
+
+    if (!currentApi) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối', replyOpts);
+      return;
+    }
+
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      `⚠️ Bạn chắc muốn rời nhóm <b>${entry.name}</b>?\nBot sẽ rời nhóm Zalo và xoá topic này.`,
+      {
+        ...replyOpts,
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Rời nhóm', callback_data: `lg:${threadId}` },
+            { text: '❌ Huỷ',      callback_data: 'lg:cancel'       },
+          ]],
+        },
+      },
+    );
+  });
+
   tgBot.on('callback_query', async (ctx) => {
     const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
 
@@ -639,6 +688,40 @@ export function setupTelegramHandler(
       } catch (err) {
         console.error('[TG→Zalo] lock_poll callback error:', err);
         try { await ctx.answerCbQuery('❌ Lỗi khoá bình chọn'); } catch { /* ignore */ }
+      }
+      return;
+    }
+
+    // ── lg: leave group confirm ──────────────────────────────────────────────
+    if (data?.startsWith('lg:')) {
+      if (data === 'lg:cancel') {
+        await ctx.answerCbQuery('❌ Đã huỷ');
+        await ctx.editMessageReplyMarkup(undefined);
+        return;
+      }
+      const topicId = Number(data.slice(3));
+      const entry = store.getEntryByTopic(topicId);
+      if (!entry || !currentApi) {
+        await ctx.answerCbQuery('❌ Không tìm thấy topic');
+        return;
+      }
+      try {
+        await currentApi.leaveGroup(entry.zaloId);
+        store.remove(topicId);
+        groupsCache.set([]);
+        await ctx.answerCbQuery('✅ Đã rời nhóm');
+        await ctx.editMessageReplyMarkup(undefined);
+        // Đóng topic (close = archive, không xoá hẳn để còn lịch sử)
+        await ctx.telegram.closeForumTopic(config.telegram.groupId, topicId)
+          .catch(() => undefined);
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `🚪 Đã rời nhóm <b>${entry.name}</b> và đóng topic.`,
+          { message_thread_id: topicId, parse_mode: 'HTML' },
+        ).catch(() => undefined);
+      } catch (err) {
+        console.error('[cb/lg]', err);
+        await ctx.answerCbQuery('❌ Rời nhóm thất bại');
       }
       return;
     }

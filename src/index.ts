@@ -30,6 +30,7 @@ async function main(): Promise<void> {
     { command: 'addfriend',      description: 'Tìm & kết bạn Zalo theo số điện thoại' },
     { command: 'addgroup',       description: 'Tạo topic cho nhóm Zalo chưa có topic' },
     { command: 'joingroup',      description: 'Tham gia nhóm Zalo qua link' },
+    { command: 'leavegroup',     description: 'Rời nhóm Zalo & đóng topic (dùng trong topic nhóm)' },
     { command: 'friendrequests', description: 'Xem lời mời kết bạn & lời mời nhóm' },
     { command: 'topic',          description: 'Quản lý topic: list / info / delete' },
     { command: 'recall',         description: 'Thu hồi tin nhắn (reply vào tin đã gửi)' },
