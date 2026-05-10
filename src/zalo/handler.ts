@@ -106,6 +106,29 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
   }
 }
 
+// ── Group info cache (avoid repeated getGroupInfo on every message) ───────────
+interface GroupInfoEntry { name: string; avt?: string; ts: number }
+const _groupInfoCache = new Map<string, GroupInfoEntry>();
+const GROUP_INFO_TTL = 5 * 60 * 1000; // 5 min
+
+async function getCachedGroupInfo(
+  api: ZaloAPI,
+  zaloId: string,
+): Promise<{ name?: string; avt?: string }> {
+  const hit = _groupInfoCache.get(zaloId);
+  if (hit && Date.now() - hit.ts < GROUP_INFO_TTL) return hit;
+  try {
+    const info = await api.getGroupInfo(zaloId) as ZaloGroupInfoResponse;
+    const entry: GroupInfoEntry = {
+      name: info?.gridInfoMap?.[zaloId]?.name ?? '',
+      avt:  info?.gridInfoMap?.[zaloId]?.avt,
+      ts:   Date.now(),
+    };
+    _groupInfoCache.set(zaloId, entry);
+    return entry;
+  } catch { return {}; }
+}
+
 async function getOrCreateTopic(
   zaloId: string,
   type: 0 | 1,
@@ -235,15 +258,35 @@ export function setupZaloHandler(api: ZaloAPI): void {
       // Keep userCache up-to-date so TG→Zalo mention resolution works
       userCache.save(msg.data.uidFrom, senderName);
 
-      // Resolve group name
+      // Parse content early so we can start media download in parallel with topic resolution
+      const { text, media } = parseContent(msg.data.content);
+
+      // Determine media URL eagerly (before topic lookup) so download starts immediately
+      const _eagerMediaUrl = (() => {
+        if (msgType === ZALO_MSG_TYPES.VIDEO || msgType === ZALO_MSG_TYPES.VOICE ||
+            msgType === ZALO_MSG_TYPES.GIF   || msgType === ZALO_MSG_TYPES.FILE) return media.href;
+        if (msgType === ZALO_MSG_TYPES.PHOTO) {
+          let u = media.href;
+          try { const p = JSON.parse(media.params ?? '{}') as { hd?: string }; if (p.hd) u = p.hd; } catch {}
+          return u;
+        }
+        return undefined;
+      })();
+      const _extGuess = _eagerMediaUrl
+        ? (path.extname(_eagerMediaUrl.split('?')[0] ?? '').toLowerCase() || '.bin')
+        : '.bin';
+      // Start download immediately; we'll await it inside the type-specific branch
+      const earlyDlPromise = _eagerMediaUrl
+        ? downloadToTemp(_eagerMediaUrl, `dl_${Date.now()}${_extGuess}`)
+        : null;
+
+      // Resolve group name (using cached info)
       let displayName = senderName;
       let groupAvatarUrl: string | undefined;
       if (type === ThreadType.Group) {
-        try {
-          const info = await api.getGroupInfo(zaloId) as ZaloGroupInfoResponse;
-          displayName = info?.gridInfoMap?.[zaloId]?.name ?? senderName;
-          groupAvatarUrl = info?.gridInfoMap?.[zaloId]?.avt;
-        } catch { /* non-fatal */ }
+        const info = await getCachedGroupInfo(api, zaloId);
+        displayName = info.name || senderName;
+        groupAvatarUrl = info.avt;
       }
 
       const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
@@ -287,8 +330,6 @@ export function setupZaloHandler(api: ZaloAPI): void {
       const saveTgMapping = (sent: { message_id: number }) => {
         msgStore.save(sent.message_id, zaloMsgIds, zaloQuoteData);
       };
-
-      const { text, media } = parseContent(msg.data.content);
 
       // ── 1. Plain text ──────────────────────────────────────────────────────
       if (msgType === ZALO_MSG_TYPES.TEXT || (text !== null)) {
@@ -339,9 +380,9 @@ export function setupZaloHandler(api: ZaloAPI): void {
           { senderName, topicId, tgBase, zaloQuote: zaloQuoteData },
           async (buf) => {
             if (buf.urls.length === 1) {
-              // Single photo — send normally
+              // Single photo — reuse eagerly started download (likely already done)
               const singleUrl = buf.urls[0]!;
-              const localPath = await downloadToTemp(singleUrl, `photo_${Date.now()}.jpg`);
+              const localPath = await (earlyDlPromise ?? downloadToTemp(singleUrl, `photo_${Date.now()}.jpg`));
               const stream = createReadStream(localPath);
               try {
                 const sent = await tg.sendPhoto(
@@ -371,12 +412,11 @@ ${escapeHtml(photoCaption)}`
                 });
               } finally { await cleanTemp(localPath); }
             } else {
-              // Multi-photo album — download all and send as media group
+              // Multi-photo album — download all concurrently and send as media group
               const localPaths: string[] = [];
               try {
-                for (const u of buf.urls) {
-                  localPaths.push(await downloadToTemp(u, `photo_${Date.now()}.jpg`));
-                }
+                const dlPaths = await Promise.all(buf.urls.map(u => downloadToTemp(u, `photo_${Date.now()}.jpg`)));
+                localPaths.push(...dlPaths);
                 const captionText = type === ThreadType.Group
                   ? photoCaption
                     ? `${groupCaption(buf.senderName)}
@@ -415,8 +455,6 @@ ${escapeHtml(photoCaption)}`
           },
         );
 
-        // Peek: if childnumber === 0 and no existing buffer, timer fires immediately
-        // (actually always deferred 600ms — that's fine)
         return;
       }
 
@@ -441,7 +479,7 @@ ${escapeHtml(photoCaption)}`
           return;
         }
         const ext = path.extname(url.split('?')[0] ?? '').toLowerCase() || '.mp4';
-        const localPath = await downloadToTemp(url, `gif_${Date.now()}${ext}`);
+        const localPath = await (earlyDlPromise ?? downloadToTemp(url, `gif_${Date.now()}${ext}`));
         const stream = createReadStream(localPath);
         try {
           const sent = await tg.sendAnimation(
@@ -463,7 +501,7 @@ ${escapeHtml(photoCaption)}`
           console.warn('[ZaloHandler] File: no URL found in content:', media);
           return;
         }
-        const localPath = await downloadToTemp(url, fileName);
+        const localPath = await (earlyDlPromise ?? downloadToTemp(url, fileName));
         const stream = createReadStream(localPath);
         try {
           const sent = await tg.sendDocument(
@@ -480,7 +518,7 @@ ${escapeHtml(photoCaption)}`
       if (msgType === ZALO_MSG_TYPES.VIDEO) {
         const url = media.href;
         if (!url) { console.warn('[ZaloHandler] Video: no URL found in content:', media); return; }
-        const localPath = await downloadToTemp(url, `video_${Date.now()}.mp4`);
+        const localPath = await (earlyDlPromise ?? downloadToTemp(url, `video_${Date.now()}.mp4`));
         const stream = createReadStream(localPath);
         try {
           const sent = await tg.sendVideo(config.telegram.groupId, { source: stream }, tgOpts);
@@ -494,7 +532,7 @@ ${escapeHtml(photoCaption)}`
         const url = media.href;
         if (!url) { console.warn('[ZaloHandler] Voice: no URL found in content:', media); return; }
         const ext = path.extname(url.split('?')[0] ?? '').toLowerCase() || '.m4a';
-        const localPath = await downloadToTemp(url, `voice_${Date.now()}${ext}`);
+        const localPath = await (earlyDlPromise ?? downloadToTemp(url, `voice_${Date.now()}${ext}`));
         const stream = createReadStream(localPath);
         try {
           const sent = await tg.sendVoice(config.telegram.groupId, { source: stream }, tgOpts);

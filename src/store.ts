@@ -410,7 +410,7 @@ export const zaloAlbumStore = {
       existing.timer = setTimeout(() => {
         _zaloAlbumBuffers.delete(key);
         onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta });
-      }, 600);
+      }, 200);
     } else {
       const buf: ZaloAlbumBuffer = {
         ...meta,
@@ -419,7 +419,7 @@ export const zaloAlbumStore = {
         timer: setTimeout(() => {
           _zaloAlbumBuffers.delete(key);
           onFlush({ urls: buf.urls, zaloMsgIds: buf.zaloMsgIds, ...meta });
-        }, 600),
+        }, 200),
       };
       _zaloAlbumBuffers.set(key, buf);
     }
