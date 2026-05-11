@@ -389,6 +389,45 @@ export const sentMsgStore = {
   },
 };
 
+// ── Reaction summary store (Zalo→TG reaction aggregation) ────────────────────
+
+export interface ReactionSummaryEntry {
+  summaryTgMsgId: number | null;
+  /** emoji → actor display names (ordered by arrival) */
+  reactions: Record<string, string[]>;
+  debounceTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const _reactionSummaries = new Map<number, ReactionSummaryEntry>(); // tgMsgId → entry
+
+export const reactionSummaryStore = {
+  /** Add or update a reaction. Returns the entry for this tgMsgId. */
+  upsert(tgMsgId: number, emoji: string, actorName: string): ReactionSummaryEntry {
+    let entry = _reactionSummaries.get(tgMsgId);
+    if (!entry) {
+      entry = { summaryTgMsgId: null, reactions: {}, debounceTimer: null };
+      _reactionSummaries.set(tgMsgId, entry);
+    }
+    if (!entry.reactions[emoji]) entry.reactions[emoji] = [];
+    if (!entry.reactions[emoji]!.includes(actorName)) {
+      entry.reactions[emoji]!.push(actorName);
+    }
+    return entry;
+  },
+
+  setSummaryMsgId(tgMsgId: number, summaryMsgId: number): void {
+    const entry = _reactionSummaries.get(tgMsgId);
+    if (entry) entry.summaryTgMsgId = summaryMsgId;
+  },
+
+  buildText(entry: ReactionSummaryEntry): string {
+    return Object.entries(entry.reactions)
+      .filter(([, names]) => names.length > 0)
+      .map(([emoji, names]) => `${emoji} ${names.join(', ')}`)
+      .join('  ');
+  },
+};
+
 const REACTION_ECHO_TTL_MS = 8_000;
 const _pendingReactionEchoes = new Map<string, { count: number; ts: number }>();
 

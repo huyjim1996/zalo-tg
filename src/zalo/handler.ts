@@ -10,7 +10,7 @@ import { tgBot } from '../telegram/bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyMentionsHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, type ZaloQuoteData } from '../store.js';
 import { tgQueue } from '../utils/tgQueue.js';
 
 // Proxy that routes every tg.* call through the rate-limit queue
@@ -1160,20 +1160,41 @@ ${escapeHtml(photoCaption)}`
       const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom : undefined;
       const actorName = rawName || await resolveUserDisplayName(api, actorUid, 'ai đó');
 
-      // Incoming Zalo reactions are already applied on the Zalo side.
-      // Forward them to Telegram only; mirroring them back into Zalo can create
-      // self-echo loops in DM topics.
+      // Aggregate reactions: update the summary entry then debounce send/edit
+      const entry = reactionSummaryStore.upsert(tgMsgId, emoji, actorName);
 
-      // Send reaction emoji as a reply to the forwarded TG message
-      await tg.sendMessage(
-        config.telegram.groupId,
-        `${emoji} <b>${escapeHtml(actorName)}</b>`,
-        {
-          message_thread_id: topicId,
-          parse_mode: 'HTML',
-          reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
-        },
-      );
+      if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
+      entry.debounceTimer = setTimeout(async () => {
+        entry.debounceTimer = null;
+        const text = reactionSummaryStore.buildText(entry);
+        if (!text) return;
+        try {
+          if (entry.summaryTgMsgId === null) {
+            // First reaction: send a new reply message
+            const sent = await tg.sendMessage(
+              config.telegram.groupId,
+              text,
+              {
+                message_thread_id: topicId,
+                parse_mode: 'HTML',
+                reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
+              },
+            );
+            reactionSummaryStore.setSummaryMsgId(tgMsgId, sent.message_id);
+          } else {
+            // Subsequent reactions: edit the existing summary message
+            await tg.editMessageText(
+              config.telegram.groupId,
+              entry.summaryTgMsgId,
+              undefined,
+              text,
+              { parse_mode: 'HTML' },
+            );
+          }
+        } catch (editErr) {
+          console.warn('[ZaloHandler] Reaction summary update failed:', editErr);
+        }
+      }, 600);
     } catch (err) {
       console.error('[ZaloHandler] Reaction error:', err);
     }
