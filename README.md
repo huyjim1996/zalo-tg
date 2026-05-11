@@ -244,8 +244,23 @@ src/
 
 ---
 
-## License
+## Contributors
 
-MIT
+Thanks to everyone who has contributed to this project.
+
+### Code Contributors
+
+- [@thanhnguyenhy234](https://github.com/thanhnguyenhy234)  
+  Contributed improvements for self-sent Zalo message forwarding, Telegram command UX, reaction display names, and reaction echo loop prevention.
+
+- [@leolionart](https://github.com/leolionart)  
+  Contributed improvements for muted Zalo group handling, marking replies as seen, and reaction notification loop fixes.
+
+### Want to contribute?
+
+Contributions are welcome!  
+If you want to fix bugs, add features, improve documentation, or suggest improvements, feel free to open a Pull Request.
+
+To get listed here, submit a meaningful contribution through a Pull Request.
 
 ---
