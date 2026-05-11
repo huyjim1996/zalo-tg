@@ -1384,8 +1384,9 @@ ${escapeHtml(photoCaption)}`
       }
 
       // ── Group name change: update TG topic name ────────────────────────────────────────
-      if (type === 'update_setting') {
-        console.log(`[ZaloHandler] update_setting raw event:`, JSON.stringify(event, null, 2));
+      // Zalo sends act="update" (type="update") when group is renamed, with groupName in data.
+      // act="update_setting" is kept as fallback.
+      if (type === 'update' || type === 'update_setting') {
         const newName: string = (
           (data?.groupName as string | undefined) ??
           (data?.name     as string | undefined) ??
@@ -1400,10 +1401,8 @@ ${escapeHtml(photoCaption)}`
             const existing = store.getEntryByTopic(tId);
             if (existing) store.set({ ...existing, name: newName });
             _groupInfoCache.delete(groupId);
-            console.log(`[ZaloHandler] GroupEvent update_setting: group ${groupId} renamed to "${newName}"`);
+            console.log(`[ZaloHandler] GroupEvent ${type}: group ${groupId} renamed to "${newName}"`);
           }
-        } else {
-          console.log(`[ZaloHandler] update_setting: groupName field is empty, no rename performed`);
         }
         return;
       }
