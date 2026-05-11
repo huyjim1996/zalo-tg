@@ -1175,16 +1175,17 @@ ${escapeHtml(photoCaption)}`
       const topicId = store.getTopicByZalo(String(zaloId), type);
       if (topicId === undefined) return;
 
-      // Delete the forwarded TG message
-      await tg.deleteMessage(config.telegram.groupId, tgMsgId);
-      console.log(`[ZaloHandler] Undo: deleted TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
-
-      // Notify in topic
+      // Reply to the original forwarded TG message to notify it was recalled on Zalo
       await tg.sendMessage(
         config.telegram.groupId,
-        `<i>🗑 Tin nhắn đã được thu hồi</i>`,
-        { message_thread_id: topicId, parse_mode: 'HTML' },
+        `<i>🗑 Tin nhắn này đã bị thu hồi trên Zalo</i>`,
+        {
+          message_thread_id: topicId,
+          parse_mode: 'HTML',
+          reply_to_message_id: tgMsgId,
+        },
       );
+      console.log(`[ZaloHandler] Undo: notified recall for TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
     } catch (err) {
       console.error('[ZaloHandler] Undo error:', err);
     }
