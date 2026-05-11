@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { gzipSync, gunzipSync } from 'zlib';
 import path from 'path';
 import { config } from './config.js';
 
@@ -145,10 +146,15 @@ const _msgMapFile = path.resolve(config.dataDir, 'msg-map.json');
 function _loadMsgMap(): MsgMapData {
   if (!existsSync(_msgMapFile)) return { pairs: [], quotes: [] };
   try {
-    const raw = JSON.parse(readFileSync(_msgMapFile, 'utf8')) as MsgMapFile;
+    let buf = readFileSync(_msgMapFile);
+    // Detect gzip by magic bytes 0x1F 0x8B
+    if (buf[0] === 0x1F && buf[1] === 0x8B) buf = gunzipSync(buf);
+    const raw = JSON.parse(buf.toString('utf8')) as MsgMapFile;
     // v2 compact format
     if ('v' in raw && raw.v === 2) {
       const { s, p, q } = raw;
+      // Filter out sentinel "0" / empty pairs (came from undefined realMsgId)
+      const pairs = p.filter(([k]) => k && k !== '0');
       const quotes: [number, ZaloQuoteData][] = q.map(
         ([tgId, msgId, cliMsgId, uidIdx, ts, typeIdx, content, ttl, zaloIdx, threadType]) => [
           tgId,
@@ -165,10 +171,11 @@ function _loadMsgMap(): MsgMapData {
           } satisfies ZaloQuoteData,
         ],
       );
-      return { pairs: p, quotes };
+      return { pairs, quotes };
     }
-    // v1 legacy format
-    return raw as MsgMapData;
+    // v1 legacy format — also filter zeros
+    const v1 = raw as MsgMapData;
+    return { pairs: v1.pairs.filter(([k]) => k && k !== '0'), quotes: v1.quotes };
   } catch { return { pairs: [], quotes: [] }; }
 }
 
@@ -208,10 +215,12 @@ function _scheduleMsgPersist(): void {
       const data: MsgMapV2 = {
         v: 2,
         s: _intern,
-        p: _msgKeyOrder.map(k => [k, _zaloToTg.get(k)!] as [string, number]),
+        // Skip sentinel "0" / empty keys — they carry no useful information
+        p: _msgKeyOrder.filter(k => k && k !== '0').map(k => [k, _zaloToTg.get(k)!] as [string, number]),
         q,
       };
-      writeFileSync(_msgMapFile, JSON.stringify(data), 'utf8');
+      // gzip the JSON — reduces file size ~70% with zero new deps
+      writeFileSync(_msgMapFile, gzipSync(JSON.stringify(data), { level: 9 }));
     } catch (e) {
       console.warn('[msgStore] Failed to persist msg-map:', e);
     }
@@ -255,14 +264,17 @@ export const msgStore = {
    * @param quote        Data needed to quote this message in future sends.
    */
   save(tgMsgId: number, zaloMsgIds: string[], quote: ZaloQuoteData): void {
-    while (_msgKeyOrder.length + zaloMsgIds.length > MSG_CACHE_MAX) {
+    // Drop sentinel "0" and empty IDs — they are realMsgId=0 placeholders,
+    // nobody ever queries getTgMsgId("0") so storing them is pure waste.
+    const validIds = zaloMsgIds.filter(id => id && id !== '0');
+    while (_msgKeyOrder.length + validIds.length > MSG_CACHE_MAX) {
       const old = _msgKeyOrder.shift();
       if (!old) break;
       const oldTg = _zaloToTg.get(old);
       _zaloToTg.delete(old);
       if (oldTg !== undefined) _tgToQuote.delete(oldTg);
     }
-    for (const id of zaloMsgIds) {
+    for (const id of validIds) {
       _zaloToTg.set(id, tgMsgId);
       _msgKeyOrder.push(id);
     }
