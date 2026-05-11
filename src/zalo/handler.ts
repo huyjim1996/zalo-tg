@@ -209,9 +209,12 @@ async function getOrCreateTopic(
   type: 0 | 1,
   displayName: string,
   avatarUrl?: string,
+  forceRecreate = false,
 ): Promise<number> {
-  const existing = store.getTopicByZalo(zaloId, type);
-  if (existing !== undefined) return existing;
+  if (!forceRecreate) {
+    const existing = store.getTopicByZalo(zaloId, type);
+    if (existing !== undefined) return existing;
+  }
 
   const pendingKey = `${type}:${zaloId}`;
   const inFlight = _pendingTopics.get(pendingKey);
@@ -221,6 +224,38 @@ async function getOrCreateTopic(
     .finally(() => _pendingTopics.delete(pendingKey));
   _pendingTopics.set(pendingKey, promise);
   return promise;
+}
+
+/**
+ * Check if a TG API error means the topic/thread was deleted.
+ * If so, remove the stale mapping and re-throw so the caller can recreate.
+ */
+function isTopicDeletedError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('message thread not found') || msg.includes('TOPIC_CLOSED') || msg.includes('thread not found');
+}
+
+/**
+ * Wrapper around a TG send call: if it fails because the topic was deleted,
+ * remove stale mapping, recreate the topic, and retry once.
+ */
+async function sendWithTopicRecovery<T>(
+  zaloId: string,
+  type: 0 | 1,
+  displayName: string,
+  avatarUrl: string | undefined,
+  sendFn: (topicId: number) => Promise<T>,
+  currentTopicId: number,
+): Promise<T> {
+  try {
+    return await sendFn(currentTopicId);
+  } catch (err) {
+    if (!isTopicDeletedError(err)) throw err;
+    console.warn(`[Zalo→TG] Topic ${currentTopicId} deleted — removing mapping and recreating for ${zaloId}`);
+    store.remove(currentTopicId);
+    const newTopicId = await getOrCreateTopic(zaloId, type, displayName, avatarUrl, true);
+    return sendFn(newTopicId);
+  }
 }
 
 async function _doCreateTopic(
@@ -415,13 +450,19 @@ export function setupZaloHandler(api: ZaloAPI): void {
         ? downloadToTemp(_eagerMediaUrl, `dl_${Date.now()}${_extGuess}`)
         : null;
 
-      // Resolve group name (using cached info)
+      // Resolve display name:
+      //   - Group: use group name from getGroupInfo
+      //   - DM: use the PEER's name (zaloId = peer UID), not the sender's name
       let displayName = senderName;
       let groupAvatarUrl: string | undefined;
       if (type === ThreadType.Group) {
         const info = await getCachedGroupInfo(api, zaloId);
         displayName = info.name || senderName;
         groupAvatarUrl = info.avt;
+      } else {
+        // For DMs, zaloId is the peer's UID — resolve their display name
+        const peerName = await resolveUserDisplayName(api, zaloId, senderName);
+        displayName = peerName;
       }
 
       const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
@@ -1047,7 +1088,17 @@ ${escapeHtml(photoCaption)}`
       });
       saveTgMapping(sentFallback);
     } catch (err) {
-      console.error('[ZaloHandler] Error:', err);
+      // If the TG topic was deleted, clear the stale mapping so the next message
+      // from this conversation will trigger topic recreation automatically.
+      if (isTopicDeletedError(err)) {
+        const staleTopicId = store.getTopicByZalo(msg.threadId, msg.type as 0 | 1);
+        if (staleTopicId !== undefined) {
+          console.warn(`[Zalo→TG] Topic ${staleTopicId} was deleted — removing stale mapping for ${msg.threadId}`);
+          store.remove(staleTopicId);
+        }
+      } else {
+        console.error('[ZaloHandler] Error:', err);
+      }
     }
   });
 
