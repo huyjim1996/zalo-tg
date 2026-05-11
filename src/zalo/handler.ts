@@ -483,9 +483,28 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       let tgReplyMsgId: number | undefined;
       if (msg.data.quote) {
         const globalId = String(msg.data.quote.globalMsgId);
-        // Primary: messages received from Zalo and forwarded to TG
-        // Fallback: messages we sent from TG to Zalo (reverse lookup)
-        tgReplyMsgId = msgStore.getTgMsgId(globalId) ?? sentMsgStore.getByZaloMsgId(globalId);
+        // Primary: messages received from Zalo and forwarded to TG.
+        // IMPORTANT: Zalo globalMsgId is NOT unique across groups — validate the found
+        // mapping belongs to the same thread to avoid quoting a message from a different group.
+        const _candidateTg = msgStore.getTgMsgId(globalId);
+        if (_candidateTg !== undefined) {
+          const _quoteData = msgStore.getQuote(_candidateTg);
+          if (!_quoteData || _quoteData.zaloId === zaloId) {
+            tgReplyMsgId = _candidateTg;
+          } else {
+            console.warn(`[Zalo→TG] Quote globalMsgId=${globalId} maps to thread ${_quoteData.zaloId} but current thread is ${zaloId} — ignoring stale cross-group mapping`);
+          }
+        }
+        // Fallback: messages we sent from TG to Zalo (reverse lookup), also validate thread
+        if (tgReplyMsgId === undefined) {
+          const _sentTg = sentMsgStore.getByZaloMsgId(globalId);
+          if (_sentTg !== undefined) {
+            const _sentInfo = sentMsgStore.get(_sentTg);
+            if (!_sentInfo || _sentInfo.zaloId === zaloId) {
+              tgReplyMsgId = _sentTg;
+            }
+          }
+        }
       }
 
       // Base TG send options (with optional reply_parameters)
