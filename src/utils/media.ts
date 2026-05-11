@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { createWriteStream, mkdirSync } from 'fs';
-import { unlink } from 'fs/promises';
+import { stat, unlink } from 'fs/promises';
 import { spawn } from 'child_process';
 import path from 'path';
 import os from 'os';
@@ -8,7 +8,7 @@ import os from 'os';
 const TMP_DIR = path.join(os.tmpdir(), 'zalo-tg');
 
 /** Download a remote URL to a temp file. Returns the local file path. */
-export async function downloadToTemp(url: string, fileName?: string): Promise<string> {
+export async function downloadToTemp(url: string, fileName?: string, retries = 3): Promise<string> {
   mkdirSync(TMP_DIR, { recursive: true });
 
   // Sanitize filename and add a unique prefix so concurrent downloads
@@ -18,22 +18,43 @@ export async function downloadToTemp(url: string, fileName?: string): Promise<st
     .replace(/[^a-zA-Z0-9._-]/g, '_')
     .slice(0, 128);
 
-  const filePath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (attempt > 0) {
+      // Exponential backoff: 500ms, 1500ms, ...
+      await new Promise(r => setTimeout(r, 500 * attempt * attempt));
+    }
 
-  const resp = await axios.get<NodeJS.ReadableStream>(url, {
-    responseType: 'stream',
-    timeout: 30_000,
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
-  });
+    const filePath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
+    try {
+      const resp = await axios.get<NodeJS.ReadableStream>(url, {
+        responseType: 'stream',
+        timeout: 30_000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
+      });
 
-  await new Promise<void>((resolve, reject) => {
-    const writer = createWriteStream(filePath);
-    resp.data.pipe(writer);
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
+      await new Promise<void>((resolve, reject) => {
+        const writer = createWriteStream(filePath);
+        resp.data.pipe(writer);
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
 
-  return filePath;
+      const { size } = await stat(filePath);
+      if (size === 0) {
+        await unlink(filePath).catch(() => undefined);
+        lastErr = new Error(`Downloaded file is empty: ${url}`);
+        continue;
+      }
+
+      return filePath;
+    } catch (err) {
+      await unlink(filePath).catch(() => undefined);
+      lastErr = err;
+    }
+  }
+
+  throw lastErr;
 }
 
 /** Remove a temp file, ignoring errors. */

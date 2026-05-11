@@ -603,7 +603,13 @@ ${escapeHtml(photoCaption)}`
               // Multi-photo album — download all concurrently and send as media group
               const localPaths: string[] = [];
               try {
-                const dlPaths = await Promise.all(buf.urls.map(u => downloadToTemp(u, `photo_${Date.now()}.jpg`)));
+                const dlResults = await Promise.allSettled(buf.urls.map(u => downloadToTemp(u, `photo_${Date.now()}.jpg`)));
+                const dlPaths = dlResults.flatMap(r => {
+                  if (r.status === 'fulfilled') return [r.value];
+                  console.warn('[ZaloHandler] Album: skipping failed photo download:', r.reason);
+                  return [];
+                });
+                if (dlPaths.length === 0) return;
                 localPaths.push(...dlPaths);
                 const captionText = type === ThreadType.Group
                   ? photoCaption
@@ -611,30 +617,37 @@ ${escapeHtml(photoCaption)}`
 ${escapeHtml(photoCaption)}`
                     : groupCaption(buf.senderName)
                   : photoCaption ? escapeHtml(photoCaption) : undefined;
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const mediaItems: any[] = localPaths.map((lp, i) => ({
-                  type: 'photo',
-                  media: { source: createReadStream(lp) },
-                  ...(i === 0 && captionText ? { caption: captionText, parse_mode: 'HTML' } : {}),
-                }));
-                const sentMsgs = await tg.sendMediaGroup(
-                  config.telegram.groupId,
-                  mediaItems,
-                  { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
-                );
-                // Save mapping for first photo (for reply chain)
-                if (sentMsgs.length > 0) {
-                  msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, {
-                    msgId: buf.zaloMsgIds[0]!,
-                    cliMsgId: '',
-                    uidFrom: msg.data.uidFrom,
-                    ts: msg.data.ts,
-                    msgType,
-                    content: msg.data.content as string | Record<string, unknown>,
-                    ttl: msg.data.ttl ?? 0,
-                    zaloId,
-                    threadType: type,
-                  });
+                // Telegram limits media groups to 10 items — split into batches
+                const BATCH = 10;
+                let firstSaved = false;
+                for (let i = 0; i < localPaths.length; i += BATCH) {
+                  const batch = localPaths.slice(i, i + BATCH);
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const mediaItems: any[] = batch.map((lp, j) => ({
+                    type: 'photo',
+                    media: { source: createReadStream(lp) },
+                    ...(i === 0 && j === 0 && captionText ? { caption: captionText, parse_mode: 'HTML' } : {}),
+                  }));
+                  const sentMsgs = await tg.sendMediaGroup(
+                    config.telegram.groupId,
+                    mediaItems,
+                    { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
+                  );
+                  // Save mapping for the very first photo (for reply chain)
+                  if (!firstSaved && sentMsgs.length > 0) {
+                    firstSaved = true;
+                    msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, {
+                      msgId: buf.zaloMsgIds[0]!,
+                      cliMsgId: '',
+                      uidFrom: msg.data.uidFrom,
+                      ts: msg.data.ts,
+                      msgType,
+                      content: msg.data.content as string | Record<string, unknown>,
+                      ttl: msg.data.ttl ?? 0,
+                      zaloId,
+                      threadType: type,
+                    });
+                  }
                 }
               } finally {
                 for (const lp of localPaths) await cleanTemp(lp);
