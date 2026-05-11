@@ -37,6 +37,41 @@ function getChangelog(): string {
   }
 }
 
+/** Manually trigger an update check. Returns the notification message sent, or null if up to date. */
+export async function checkForUpdates(telegram: Telegraf['telegram'], groupId: number, threadId?: number): Promise<void> {
+  const commit = getNewCommit();
+  const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+  if (!commit) {
+    await telegram.sendMessage(
+      groupId,
+      '✅ <b>Bot đang ở phiên bản mới nhất!</b>',
+      { ...replyOpts, parse_mode: 'HTML' },
+    );
+    return;
+  }
+
+  const changelog = getChangelog();
+  await telegram.sendMessage(
+    groupId,
+    `🔔 <b>Có bản cập nhật mới!</b>\n\n${
+      changelog
+        ? changelog.split('\n').slice(0, 10).map(l => `• ${l}`).join('\n') + '\n\n'
+        : ''
+    }Bạn có muốn cập nhật bot không?`,
+    {
+      ...replyOpts,
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Cập nhật ngay', callback_data: `ua:yes:${commit}` },
+          { text: '❌ Bỏ qua',         callback_data: `ua:no:${commit}`  },
+        ]],
+      },
+    },
+  );
+}
+
 export function startUpdateChecker(bot: Telegraf): void {
 
   // ── Callback: ua:yes:<hash> / ua:no:<hash> ─────────────────────────────────

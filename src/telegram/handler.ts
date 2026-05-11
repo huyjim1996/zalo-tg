@@ -8,6 +8,7 @@ import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
+import { checkForUpdates } from '../updater.js';
 
 // ── Mention resolution helper ──────────────────────────────────────────────
 
@@ -697,6 +698,25 @@ export function setupTelegramHandler(
     } catch (err) {
       console.error('[/joingroup]', err);
       await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Không thể tham gia nhóm. Link có thể đã hết hạn hoặc không hợp lệ.', replyOpts);
+    }
+  });
+
+  // ── /checkupdates ───────────────────────────────────────────────────────────
+  tgBot.command('checkupdates', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    try {
+      await checkForUpdates(ctx.telegram, config.telegram.groupId, threadId);
+    } catch (err) {
+      console.error('[/checkupdates]', err);
+      const replyOpts = threadId ? { message_thread_id: threadId } : {};
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `❌ Không thể kiểm tra cập nhật: ${err instanceof Error ? err.message : String(err)}`,
+        replyOpts,
+      );
     }
   });
 

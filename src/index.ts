@@ -43,6 +43,7 @@ async function main(): Promise<void> {
     { command: 'friendrequests', description: 'Xem lời mời kết bạn & lời mời nhóm' },
     { command: 'topic',          description: 'Quản lý topic: list / info / delete' },
     { command: 'recall',         description: 'Thu hồi tin nhắn (reply vào tin đã gửi)' },
+    { command: 'checkupdates',   description: 'Kiểm tra & cập nhật bot lên phiên bản mới nhất' },
   ]).catch(() => undefined);
 
   // ── Start Telegram bot so /login can be received immediately ───────────────
