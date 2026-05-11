@@ -133,6 +133,33 @@ async function getCachedGroupInfo(
 // many messages arrive concurrently for the same conversation (e.g. 20-photo album).
 const _pendingTopics = new Map<string, Promise<number>>();
 
+async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fallback = 'ai đó'): Promise<string> {
+  const cleanUid = uid?.trim();
+  if (!cleanUid) return fallback;
+
+  const cached = userCache.getName(cleanUid);
+  if (cached?.trim()) return cached;
+
+  try {
+    const resp = await api.getUserInfo(cleanUid) as {
+      changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
+      unchanged_profiles?: Record<string, unknown>;
+    };
+    const profile = (resp?.changed_profiles?.[cleanUid] ?? resp?.unchanged_profiles?.[cleanUid]) as
+      | { displayName?: string; zaloName?: string }
+      | undefined;
+    const name = profile?.displayName?.trim() || profile?.zaloName?.trim();
+    if (name) {
+      userCache.save(cleanUid, name);
+      return name;
+    }
+  } catch (err) {
+    console.warn(`[Zalo] resolveUserDisplayName failed for ${cleanUid}:`, err);
+  }
+
+  return cleanUid || fallback;
+}
+
 async function getOrCreateTopic(
   zaloId: string,
   type: 0 | 1,
@@ -1040,15 +1067,20 @@ ${escapeHtml(photoCaption)}`
       const zaloMsgId = String(gMsgIds[0]?.gMsgID ?? '');
       if (!zaloMsgId) return;
 
-      const tgMsgId = msgStore.getTgMsgId(zaloMsgId);
-      if (tgMsgId === undefined) return;
+      const tgMsgId = msgStore.getTgMsgId(zaloMsgId) ?? sentMsgStore.getByZaloMsgId(zaloMsgId);
+      if (tgMsgId === undefined) {
+        console.log(`[ZaloHandler] Reaction: no TG mapping for zaloMsgId=${zaloMsgId}`);
+        return;
+      }
 
       const zaloId = reaction?.threadId ?? data?.idTo;
       const type   = (reaction?.isGroup ? 1 : 0) as 0 | 1;
       const topicId = store.getTopicByZalo(String(zaloId), type);
       if (topicId === undefined) return;
 
-      const dName = data?.dName ?? data?.uidFrom ?? 'ai đó';
+      const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
+      const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom : undefined;
+      const actorName = rawName || await resolveUserDisplayName(api, actorUid, 'ai đó');
 
       // Auto mirror reaction in DM conversations only
       if (type === 0) {
@@ -1069,7 +1101,7 @@ ${escapeHtml(photoCaption)}`
       // Send reaction emoji as a reply to the forwarded TG message
       await tg.sendMessage(
         config.telegram.groupId,
-        `${emoji} <b>${escapeHtml(dName)}</b>`,
+        `${emoji} <b>${escapeHtml(actorName)}</b>`,
         {
           message_thread_id: topicId,
           parse_mode: 'HTML',
