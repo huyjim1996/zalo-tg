@@ -325,6 +325,13 @@ function buildScoreText(header: string, options: Pick<PollOptions, 'content' | '
 /** Track which groups already had their member cache populated this session. */
 const _memberCacheLoaded = new Set<string>();
 
+/**
+ * In-flight dedup set — holds msgIds that are currently being processed.
+ * Prevents race condition where multiple reaction re-emits arrive concurrently
+ * before any of them is saved to msgStore, causing all to pass the msgStore check.
+ */
+const _inFlightMsgIds = new Set<string>();
+
 export function setupZaloHandler(api: ZaloAPI): void {
   // Pre-populate userCache for all existing group topics on startup
   for (const entry of store.all()) {
@@ -354,11 +361,17 @@ export function setupZaloHandler(api: ZaloAPI): void {
 
       // Skip duplicate deliveries — Zalo re-emits the same message event when
       // someone reacts (❤️, 👍, etc.), causing the same content to be forwarded
-      // multiple times. If we already have a TG mapping for this msgId, skip it.
+      // multiple times. Check both the persistent store AND the in-flight set
+      // (handles concurrent re-emits that arrive before any is saved to msgStore).
       const _primaryMsgId = msg.data.msgId;
-      if (_primaryMsgId && msgStore.getTgMsgId(_primaryMsgId) !== undefined) {
-        console.log(`[Zalo→TG] Skip duplicate/reaction re-emit msgId=${_primaryMsgId}`);
-        return;
+      if (_primaryMsgId) {
+        if (msgStore.getTgMsgId(_primaryMsgId) !== undefined || _inFlightMsgIds.has(_primaryMsgId)) {
+          console.log(`[Zalo→TG] Skip duplicate/reaction re-emit msgId=${_primaryMsgId}`);
+          return;
+        }
+        _inFlightMsgIds.add(_primaryMsgId);
+        // Auto-remove from in-flight after 10 s (msgStore.save will be the permanent record)
+        setTimeout(() => _inFlightMsgIds.delete(_primaryMsgId), 10_000);
       }
 
       const zaloId     = msg.threadId;
