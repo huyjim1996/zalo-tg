@@ -129,6 +129,50 @@ async function getCachedGroupInfo(
   } catch { return {}; }
 }
 
+// ── Muted group cache (avoid repeated getMute on every message) ───────────────
+interface ZaloMuteEntry {
+  id: string;
+  duration: number;
+  startTime: number;
+  systemTime?: number;
+  currentTime?: number;
+}
+
+const MUTED_GROUPS_TTL = 60 * 1000; // 1 min
+let _mutedGroupsCache: { ids: Set<string>; ts: number } | null = null;
+
+function isActiveMute(entry: ZaloMuteEntry): boolean {
+  if (entry.duration === -1) return true;
+  if (entry.duration <= 0) return false;
+
+  const now = entry.currentTime ?? entry.systemTime ?? Math.floor(Date.now() / 1000);
+  const expiresAt = entry.startTime + entry.duration;
+  return now < expiresAt;
+}
+
+async function isMutedZaloGroup(api: ZaloAPI, groupId: string): Promise<boolean> {
+  if (!config.zalo.skipMutedGroups) return false;
+
+  const cached = _mutedGroupsCache;
+  if (cached && Date.now() - cached.ts < MUTED_GROUPS_TTL) {
+    return cached.ids.has(groupId);
+  }
+
+  try {
+    const muteInfo = await api.getMute() as { groupChatEntries?: ZaloMuteEntry[] };
+    const mutedIds = new Set(
+      (muteInfo.groupChatEntries ?? [])
+        .filter(isActiveMute)
+        .map(entry => String(entry.id)),
+    );
+    _mutedGroupsCache = { ids: mutedIds, ts: Date.now() };
+    return mutedIds.has(groupId);
+  } catch (err) {
+    console.warn('[Zalo→TG] Failed to check muted Zalo groups; forwarding message:', err);
+    return false;
+  }
+}
+
 // In-flight topic creation promises — prevents duplicate topic creation when
 // many messages arrive concurrently for the same conversation (e.g. 20-photo album).
 const _pendingTopics = new Map<string, Promise<number>>();
@@ -285,6 +329,11 @@ export function setupZaloHandler(api: ZaloAPI): void {
       const type       = msg.type as 0 | 1;
       const senderName = msg.data.dName ?? msg.data.uidFrom;
       const msgType    = msg.data.msgType ?? ZALO_MSG_TYPES.TEXT;
+
+      if (type === ThreadType.Group && await isMutedZaloGroup(api, zaloId)) {
+        console.log(`[Zalo→TG] Skip muted group ${zaloId}`);
+        return;
+      }
 
       // Pre-populate member cache the first time we see a new group
       if (type === 1 && !_memberCacheLoaded.has(zaloId)) {

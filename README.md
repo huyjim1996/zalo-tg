@@ -164,6 +164,10 @@ TG_GROUP_ID=-1001234567890
 # Directory for persistent data (topics.json, credentials.json)
 # Defaults to ./data if omitted
 DATA_DIR=./data
+
+# Skip forwarding messages from muted Zalo groups
+# Defaults to false; set to true/1/yes/on to enable
+ZALO_SKIP_MUTED_GROUPS=false
 ```
 
 ---

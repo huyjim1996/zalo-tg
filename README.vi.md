@@ -164,6 +164,10 @@ TG_GROUP_ID=-1001234567890
 # Thư mục lưu dữ liệu (topics.json, credentials.json)
 # Mặc định ./data nếu bỏ trống
 DATA_DIR=./data
+
+# Bỏ qua forward tin nhắn từ các nhóm Zalo đã tắt thông báo
+# Mặc định false; đặt true/1/yes/on để bật
+ZALO_SKIP_MUTED_GROUPS=false
 ```
 
 ---

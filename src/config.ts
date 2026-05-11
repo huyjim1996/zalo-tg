@@ -18,6 +18,12 @@ function resolvePath(envVal: string | undefined, defaultRelative: string): strin
   return path.isAbsolute(raw) ? raw : path.resolve(PROJECT_ROOT, raw);
 }
 
+function envFlag(key: string, defaultValue = false): boolean {
+  const raw = process.env[key];
+  if (raw === undefined || raw.trim() === '') return defaultValue;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
 export const config = {
   telegram: {
     token:   requireEnv('TG_TOKEN'),
@@ -25,6 +31,7 @@ export const config = {
   },
   zalo: {
     credentialsPath: resolvePath(process.env.ZALO_CREDENTIALS_PATH, 'credentials.json'),
+    skipMutedGroups: envFlag('ZALO_SKIP_MUTED_GROUPS'),
   },
   dataDir: resolvePath(process.env.DATA_DIR, 'data'),
 } as const;
