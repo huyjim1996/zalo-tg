@@ -393,6 +393,7 @@ export const sentMsgStore = {
 
 export interface ReactionSummaryEntry {
   summaryTgMsgId: number | null;
+  lastSentText: string;
   /** emoji → actor display names (ordered by arrival) */
   reactions: Record<string, string[]>;
   debounceTimer: ReturnType<typeof setTimeout> | null;
@@ -405,7 +406,7 @@ export const reactionSummaryStore = {
   upsert(tgMsgId: number, emoji: string, actorName: string): ReactionSummaryEntry {
     let entry = _reactionSummaries.get(tgMsgId);
     if (!entry) {
-      entry = { summaryTgMsgId: null, reactions: {}, debounceTimer: null };
+      entry = { summaryTgMsgId: null, lastSentText: '', reactions: {}, debounceTimer: null };
       _reactionSummaries.set(tgMsgId, entry);
     }
     if (!entry.reactions[emoji]) entry.reactions[emoji] = [];

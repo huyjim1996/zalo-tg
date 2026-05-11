@@ -1168,6 +1168,8 @@ ${escapeHtml(photoCaption)}`
         entry.debounceTimer = null;
         const text = reactionSummaryStore.buildText(entry);
         if (!text) return;
+        // Skip if text hasn't changed (same person reacting fires multiple events)
+        if (text === entry.lastSentText) return;
         try {
           if (entry.summaryTgMsgId === null) {
             // First reaction: send a new reply message
@@ -1181,6 +1183,7 @@ ${escapeHtml(photoCaption)}`
               },
             );
             reactionSummaryStore.setSummaryMsgId(tgMsgId, sent.message_id);
+            entry.lastSentText = text;
           } else {
             // Subsequent reactions: edit the existing summary message
             await tg.editMessageText(
@@ -1190,9 +1193,13 @@ ${escapeHtml(photoCaption)}`
               text,
               { parse_mode: 'HTML' },
             );
+            entry.lastSentText = text;
           }
         } catch (editErr) {
-          console.warn('[ZaloHandler] Reaction summary update failed:', editErr);
+          const msg = editErr instanceof Error ? editErr.message : String(editErr);
+          if (!msg.includes('message is not modified')) {
+            console.warn('[ZaloHandler] Reaction summary update failed:', editErr);
+          }
         }
       }, 600);
     } catch (err) {
