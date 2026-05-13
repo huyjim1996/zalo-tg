@@ -823,9 +823,21 @@ ${escapeHtml(photoCaption)}`
 
       // ── 8. Link (chat.recommended) ─────────────────────────────────────────
       if (msgType === ZALO_MSG_TYPES.LINK) {
-        // `href` is the canonical URL; fall back to `src` or the `msg` text field
-        // (both can carry the URL in some Zalo client versions).
+        // ── Missed call notification ──────────────────────────────────────────
         const rawMedia = media as Record<string, unknown>;
+        if (media.action === 'recommened.misscall') {
+          let params: { duration?: number; isCaller?: number; calltype?: number } = {};
+          try { params = JSON.parse(media.params ?? '{}'); } catch { /* ignore */ }
+          const callTypeLabel = params.calltype === 1 ? '📹 cuộc gọi video' : '📞 cuộc gọi thoại';
+          const direction = params.isCaller === 1 ? 'Bạn đã gọi (không có trả lời)' : 'Cuộc gọi nhỡ từ';
+          const callText = `${groupCaption(senderName)}${direction} <b>${escapeHtml(senderName)}</b> — ${callTypeLabel} nhỡ`;
+          const sent = await tg.sendMessage(config.telegram.groupId, callText, {
+            ...tgBase,
+            parse_mode: 'HTML',
+          });
+          saveTgMapping(sent);
+          return;
+        }
         const href = media.href
           || (typeof rawMedia['src']  === 'string' ? rawMedia['src']  : '')
           || (typeof rawMedia['msg']  === 'string' ? rawMedia['msg']  : '')

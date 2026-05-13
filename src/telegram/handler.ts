@@ -1779,7 +1779,13 @@ export function setupTelegramHandler(
             gifPath  = await convertWebmToGif(webmPath);
             sentMsgStore.markSending(zaloId);
             try {
-              await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
+              const sendResult = await api.sendMessage(
+                { msg: '', attachments: [gifPath] }, zaloId, threadType,
+              ) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
+              const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
+              if (zaloMsgId !== undefined) {
+                sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+              }
             } finally {
               sentMsgStore.unmarkSending(zaloId);
             }
