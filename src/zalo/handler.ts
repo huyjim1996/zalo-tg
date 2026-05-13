@@ -828,8 +828,10 @@ ${escapeHtml(photoCaption)}`
         if (media.action === 'recommened.misscall') {
           let params: { duration?: number; isCaller?: number; calltype?: number } = {};
           try { params = JSON.parse(media.params ?? '{}'); } catch { /* ignore */ }
-          const callText = params.calltype === 1 ? '📹 cuộc gọi video nhỡ' : '📞 cuộc gọi thoại nhỡ';
-          const sent = await tg.sendMessage(config.telegram.groupId, callText, tgBase);
+          const callText = params.calltype === 1
+            ? '<tg-emoji emoji-id="5821428153653924211">📹</tg-emoji> cuộc gọi video nhỡ'
+            : '<tg-emoji emoji-id="5800810214689084012">📞</tg-emoji> cuộc gọi thoại nhỡ';
+          const sent = await tg.sendMessage(config.telegram.groupId, callText, { ...tgBase, parse_mode: 'HTML' });
           saveTgMapping(sent);
           return;
         }

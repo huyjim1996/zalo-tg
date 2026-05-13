@@ -14,6 +14,35 @@ import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail, convert
 import { triggerQRLogin } from '../zalo/client.js';
 import { escapeHtml } from '../utils/format.js';
 
+// ── Custom emoji helper ───────────────────────────────────────────────────────
+// Maps logical names → Telegram Premium custom emoji IDs (animated).
+// Falls back to plain emoji if ID not configured.
+const EMOJI: Record<string, { id: string; fallback: string }> = {
+  status:   { id: '6336963167070984229', fallback: '📊' },
+  uptime:   { id: '5413762180178795094', fallback: '⏱' },
+  topics:   { id: '5852478130094087407', fallback: '📌' },
+  account:  { id: '4913497231492908158', fallback: '👤' },
+  online:   { id: '5999185588631114720', fallback: '🟢' },
+  offline:  { id: '5798648317130838282', fallback: '🔴' },
+  process:  { id: '5854997562204889141', fallback: '⚙️' },
+  ram:      { id: '6086966710047347885', fallback: '💾' },
+  log:      { id: '6339091748567915249', fallback: '📄' },
+  disk:     { id: '5990147448431971905', fallback: '💽' },
+  warn:     { id: '6276132901012640832', fallback: '⚠️' },
+  error:    { id: '6276132901012640832', fallback: '❌' },
+  success:  { id: '5940635490645449104', fallback: '✅' },
+  bot:      { id: '5852881749645728848', fallback: '🤖' },
+  globe:    { id: '5852557780262592341', fallback: '🌐' },
+  poll:     { id: '6336963167070984229', fallback: '📊' },
+  phone:    { id: '5800810214689084012', fallback: '📞' },
+  video:    { id: '5821428153653924211', fallback: '📹' },
+};
+/** Wrap emoji thành <tg-emoji> để hiện animated với Telegram Premium. */
+function e(name: keyof typeof EMOJI): string {
+  const cfg = EMOJI[name];
+  return cfg ? `<tg-emoji emoji-id="${cfg.id}">${cfg.fallback}</tg-emoji>` : '';
+}
+
 // Bridge start time (module load = process start)
 const _bridgeStartTime = Date.now();
 
@@ -35,9 +64,9 @@ async function getLocalApiStatus(serverUrl: string): Promise<string> {
   } catch { /* ECONNREFUSED or timeout */ }
 
   if (httpOk) {
-    lines.push(`🟢 HTTP: <b>online</b> (${httpMs} ms)`);
+    lines.push(`${e('online')} HTTP: <b>online</b> (${httpMs} ms)`);
   } else {
-    lines.push(`🔴 HTTP: <b>offline / ECONNREFUSED</b>`);
+    lines.push(`${e('offline')} HTTP: <b>offline / ECONNREFUSED</b>`);
   }
 
   // 2. Process info via pgrep
@@ -45,18 +74,18 @@ async function getLocalApiStatus(serverUrl: string): Promise<string> {
     const { stdout } = await execFileAsync('pgrep', ['-a', 'telegram-bot-api']);
     const pid = stdout.trim().split(/\s+/)[0];
     if (pid) {
-      lines.push(`⚙️ PID: <code>${pid}</code>`);
+      lines.push(`${e('process')} PID: <code>${pid}</code>`);
       // Memory (macOS: ps -o rss=)
       try {
         const { stdout: mem } = await execFileAsync('ps', ['-p', pid, '-o', 'rss=']);
         const kb = parseInt(mem.trim(), 10);
-        if (!isNaN(kb)) lines.push(`💾 RAM: <code>${(kb / 1024).toFixed(1)} MB</code>`);
+        if (!isNaN(kb)) lines.push(`${e('ram')} RAM: <code>${(kb / 1024).toFixed(1)} MB</code>`);
       } catch { /* ignore */ }
     } else {
-      lines.push(`⚙️ Process: <b>không tìm thấy</b>`);
+      lines.push(`${e('process')} Process: <b>không tìm thấy</b>`);
     }
   } catch {
-    lines.push(`⚙️ Process: <b>không tìm thấy</b>`);
+    lines.push(`${e('process')} Process: <b>không tìm thấy</b>`);
   }
 
   // 3. Log file — tail 3 dòng cuối
@@ -77,11 +106,11 @@ async function getLocalApiStatus(serverUrl: string): Promise<string> {
     const tail = buf.toString('utf8').trim().split('\n').slice(-3).join('\n');
     const lastLine = tail.split('\n').pop() ?? '';
     const hasError = /error|crash|fatal|signal 6|no space/i.test(lastLine);
-    lines.push(`📄 Log: <code>${sizeMb} MB</code> — dòng cuối:`);
+    lines.push(`${e('log')} Log: <code>${sizeMb} MB</code> — dòng cuối:`);
     lines.push(`<pre>${escapeHtml(lastLine.slice(0, 200))}</pre>`);
-    if (hasError) lines.push(`⚠️ Phát hiện lỗi trong log!`);
+    if (hasError) lines.push(`${e('warn')} Phát hiện lỗi trong log!`);
   } catch {
-    lines.push(`📄 Log: <i>không đọc được</i>`);
+    lines.push(`${e('log')} Log: <i>không đọc được</i>`);
   }
 
   // 4. Disk space gốc
@@ -252,12 +281,12 @@ async function handleLoginCommand(
       onScanned: async (displayName) => {
         await tgBot.telegram.sendMessage(
           chatId,
-          `✅ Đã quét! Chờ xác nhận từ <b>${displayName}</b>...`,
+          `${e('success')} Đã quét! Chờ xác nhận từ <b>${displayName}</b>...`,
           { ...msgOpts, parse_mode: 'HTML' },
         );
       },
       onDeclined: async () => {
-        await tgBot.telegram.sendMessage(chatId, '❌ Đăng nhập bị từ chối trên điện thoại.', msgOpts);
+        await tgBot.telegram.sendMessage(chatId, `${e('error')} Đăng nhập bị từ chối trên điện thoại.`, msgOpts);
       },
       onSuccess: async () => {
         await tgBot.telegram.sendMessage(
@@ -272,7 +301,7 @@ async function handleLoginCommand(
   } catch (err) {
     await tgBot.telegram.sendMessage(
       chatId,
-      `❌ Đăng nhập thất bại: ${String(err)}`,
+      `${e('error')} Đăng nhập thất bại: ${String(err)}`,
       msgOpts,
     ).catch(() => undefined);
   } finally {
@@ -413,10 +442,10 @@ export function setupTelegramHandler(
         zaloThreadType,
       );
       console.log(`[TG→Zalo] Recall msgId=${sent.msgId} zaloId=${sent.zaloId}`);
-      await ctx.reply('✅ Đã thu hồi tin nhắn trên Zalo');
+      await ctx.reply(`${e('success')} Đã thu hồi tin nhắn trên Zalo`);
     } catch (err) {
       console.error('[TG→Zalo] Recall error:', err);
-      await ctx.reply(`❌ Thu hồi thất bại: ${err instanceof Error ? err.message : String(err)}`);
+      await ctx.reply(`${e('error')} Thu hồi thất bại: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
 
@@ -927,30 +956,30 @@ export function setupTelegramHandler(
     const all = store.all();
     const groupCount = all.filter(e => e.type === 1).length;
     const dmCount    = all.length - groupCount;
-    let accountLine = '\n👤 Zalo: <b>chưa kết nối</b>';
+    let accountLine = `\n${e('account')} Zalo: <b>chưa kết nối</b>`;
     if (currentApi) {
       try {
         const info = await currentApi.fetchAccountInfo() as {
           profile?: { displayName?: string; zaloName?: string };
         };
         const name = info?.profile?.displayName ?? info?.profile?.zaloName ?? '?';
-        accountLine = `\n👤 Zalo: <b>${escapeHtml(name)}</b> 🟢`;
+        accountLine = `\n${e('account')} Zalo: <b>${escapeHtml(name)}</b> ${e('online')}`;
       } catch {
-        accountLine = '\n👤 Zalo: đã kết nối 🟢';
+        accountLine = `\n${e('account')} Zalo: đã kết nối ${e('online')}`;
       }
     }
     let localApiSection = '';
     if (config.telegram.localServer) {
       const apiDetail = await getLocalApiStatus(config.telegram.localServer).catch(() => '❓ Không kiểm tra được');
-      localApiSection = `\n\n🤖 <b>Local Bot API</b> (<code>${config.telegram.localServer}</code>)\n${apiDetail}`;
+      localApiSection = `\n\n${e('bot')} <b>Local Bot API</b> (<code>${config.telegram.localServer}</code>)\n${apiDetail}`;
     } else {
-      localApiSection = `\n\n🌐 <b>Bot API</b>: official <code>api.telegram.org</code> (50 MB limit)`;
+      localApiSection = `\n\n${e('globe')} <b>Bot API</b>: official <code>api.telegram.org</code> (50 MB limit)`;
     }
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
-      `📊 <b>Trạng thái Bridge</b>${accountLine}\n` +
-      `⏱ Uptime: <code>${uptimeStr}</code>\n` +
-      `📌 Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)` +
+      `${e('status')} <b>Trạng thái Bridge</b>${accountLine}\n` +
+      `${e('uptime')} Uptime: <code>${uptimeStr}</code>\n` +
+      `${e('topics')} Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)` +
       localApiSection,
       { ...replyOpts, parse_mode: 'HTML' },
     );
