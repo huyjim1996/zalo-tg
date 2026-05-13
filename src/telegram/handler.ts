@@ -399,7 +399,7 @@ export function setupTelegramHandler(
     // Look up from sentMsgStore (TG→Zalo messages we sent)
     const sent = sentMsgStore.get(replyTo.message_id);
     if (!sent) {
-      await ctx.reply('❌ Không tìm thấy tin nhắn đã gửi (chỉ thu hồi được tin mình gửi từ Telegram, và chỉ trong 300 tin gần nhất)');
+      await ctx.reply('❌ Không tìm thấy tin nhắn đã gửi (chỉ thu hồi được tin mình gửi từ Telegram)');
       return;
     }
 

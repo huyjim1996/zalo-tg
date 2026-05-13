@@ -293,16 +293,26 @@ export const msgStore = {
   },
 };
 
-// ── User cache (in-memory, not persisted) ─────────────────────────────────────
+// ── User cache (persisted to disk, gzip compact) ──────────────────────────────
+//
+// On-disk format (user-cache.json.gz):
+//   { "u": {"uid":"name",...}, "g": {"groupId":{"normName":"uid",...},...} }
+//
+// Techniques for minimum file size + maximum read speed:
+//   • Flat objects (no per-entry field names) → uid/name stored once
+//   • normName pre-computed at write → O(1) Map lookup at read, no re-normalize
+//   • gzip level 9 → ~70% smaller (Vietnamese names compress extremely well)
+//   • Debounced write (2 s) → batches rapid saves into one write
+//   • In-memory Maps → all gets are O(1), disk only read on startup
 
 /**
  * Lightweight cache of Zalo uid ↔ display name.
  * Populated automatically as messages arrive; used to resolve TG @mention text
  * back to a Zalo UID when forwarding TG → Zalo.
  */
-const USER_CACHE_MAX = 500;
-const _uidToName     = new Map<string, string>();
-const _normToUid     = new Map<string, string>();
+const USER_CACHE_MAX  = 5000;
+const _uidToName      = new Map<string, string>();
+const _normToUid      = new Map<string, string>();
 /** zaloId → (normalizedName → uid) — collision-safe per-group lookup */
 const _groupNameToUid = new Map<string, Map<string, string>>();
 
@@ -310,10 +320,72 @@ function _normName(name: string): string {
   return name.toLowerCase().trim().replace(/\s+/g, ' ');
 }
 
+// ── Persistence helpers ───────────────────────────────────────────────────────
+
+const _userCacheFile = path.resolve(config.dataDir, 'user-cache.json.gz');
+
+interface UserCacheDisk {
+  /** uid → displayName */
+  u: Record<string, string>;
+  /** groupId → { normName → uid } */
+  g: Record<string, Record<string, string>>;
+}
+
+function _loadUserCache(): void {
+  if (!existsSync(_userCacheFile)) return;
+  try {
+    const raw = JSON.parse(gunzipSync(readFileSync(_userCacheFile)).toString('utf8')) as UserCacheDisk;
+    for (const [uid, name] of Object.entries(raw.u ?? {})) {
+      _uidToName.set(uid, name);
+      _normToUid.set(_normName(name), uid);
+    }
+    for (const [gid, members] of Object.entries(raw.g ?? {})) {
+      const m = new Map<string, string>();
+      for (const [norm, uid] of Object.entries(members)) m.set(norm, uid);
+      _groupNameToUid.set(gid, m);
+    }
+    console.log(`[userCache] Loaded ${_uidToName.size} users from disk`);
+  } catch (e) {
+    console.warn('[userCache] Failed to load cache:', e);
+  }
+}
+
+let _userCacheDirty  = false;
+let _userCacheTimer: ReturnType<typeof setTimeout> | null = null;
+
+function _scheduleUserCachePersist(): void {
+  _userCacheDirty = true;
+  if (_userCacheTimer) return;
+  _userCacheTimer = setTimeout(() => {
+    _userCacheTimer = null;
+    if (!_userCacheDirty) return;
+    _userCacheDirty = false;
+    try {
+      mkdirSync(path.dirname(_userCacheFile), { recursive: true });
+      const disk: UserCacheDisk = { u: {}, g: {} };
+      for (const [uid, name] of _uidToName) disk.u[uid] = name;
+      for (const [gid, m] of _groupNameToUid) {
+        const obj: Record<string, string> = {};
+        for (const [norm, uid] of m) obj[norm] = uid;
+        disk.g[gid] = obj;
+      }
+      writeFileSync(_userCacheFile, gzipSync(JSON.stringify(disk), { level: 9 }));
+    } catch (e) {
+      console.warn('[userCache] Failed to persist:', e);
+    }
+  }, 2000);
+}
+
+// Load from disk on startup
+_loadUserCache();
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
 export const userCache = {
   /** Record a Zalo user seen in a received message. */
   save(uid: string, displayName: string): void {
-    if (_uidToName.size >= USER_CACHE_MAX) {
+    // Evict oldest only if new uid (avoid eviction on name update)
+    if (!_uidToName.has(uid) && _uidToName.size >= USER_CACHE_MAX) {
       const firstUid = _uidToName.keys().next().value;
       if (firstUid) {
         const oldName = _uidToName.get(firstUid);
@@ -323,6 +395,7 @@ export const userCache = {
     }
     _uidToName.set(uid, displayName);
     _normToUid.set(_normName(displayName), uid);
+    _scheduleUserCachePersist();
   },
 
   /** Find a Zalo UID by (normalised) display name. Used for TG→Zalo mention. */
@@ -336,6 +409,7 @@ export const userCache = {
     let m = _groupNameToUid.get(zaloId);
     if (!m) { m = new Map(); _groupNameToUid.set(zaloId, m); }
     m.set(_normName(displayName), uid);
+    // persist already scheduled by save()
   },
 
   /** Resolve UID by name, preferring group-specific lookup over global. */
@@ -467,10 +541,8 @@ export interface SentMsgInfo {
   threadType: 0 | 1;
 }
 
-const SENT_MAX = 300;
 const _sentMap      = new Map<number, SentMsgInfo>(); // tgMsgId → info
 const _sentByZaloId = new Map<string, number>();       // String(zaloMsgId) → tgMsgId
-const _sentOrder: number[] = [];
 
 /** zaloId values currently being sent by the bot (to handle echo race condition) */
 const _pendingSendConvos = new Map<string, number>(); // zaloId → timestamp
@@ -478,17 +550,8 @@ const _pendingSendConvos = new Map<string, number>(); // zaloId → timestamp
 export const sentMsgStore = {
   /** Record a message we sent from TG→Zalo. tgMsgId is the user's TG message. */
   save(tgMsgId: number, info: SentMsgInfo): void {
-    if (_sentOrder.length >= SENT_MAX) {
-      const old = _sentOrder.shift();
-      if (old !== undefined) {
-        const oldInfo = _sentMap.get(old);
-        if (oldInfo) _sentByZaloId.delete(String(oldInfo.msgId));
-        _sentMap.delete(old);
-      }
-    }
     _sentMap.set(tgMsgId, info);
     _sentByZaloId.set(String(info.msgId), tgMsgId);
-    _sentOrder.push(tgMsgId);
   },
 
   get(tgMsgId: number): SentMsgInfo | undefined {

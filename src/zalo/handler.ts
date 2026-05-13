@@ -188,11 +188,15 @@ async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fal
   try {
     const resp = await api.getUserInfo(cleanUid) as {
       changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
-      unchanged_profiles?: Record<string, unknown>;
+      unchanged_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
     };
-    const profile = (resp?.changed_profiles?.[cleanUid] ?? resp?.unchanged_profiles?.[cleanUid]) as
-      | { displayName?: string; zaloName?: string }
-      | undefined;
+    // API appends "_0" to bare UIDs before sending, so the response key is "uid_0"
+    const uidKey = cleanUid.includes('_') ? cleanUid : `${cleanUid}_0`;
+    const profile =
+      resp?.changed_profiles?.[uidKey] ??
+      resp?.changed_profiles?.[cleanUid] ??
+      resp?.unchanged_profiles?.[uidKey] ??
+      resp?.unchanged_profiles?.[cleanUid];
     const name = profile?.displayName?.trim() || profile?.zaloName?.trim();
     if (name) {
       userCache.save(cleanUid, name);
@@ -202,7 +206,9 @@ async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fal
     console.warn(`[Zalo] resolveUserDisplayName failed for ${cleanUid}:`, err);
   }
 
-  return cleanUid || fallback;
+  // Prefer the caller-supplied fallback (e.g. senderName from message data)
+  // over the raw UID — only use UID when no real name is available at all.
+  return (fallback && fallback !== 'ai đó') ? fallback : (cleanUid || fallback);
 }
 
 async function getOrCreateTopic(
@@ -1481,13 +1487,20 @@ ${escapeHtml(photoCaption)}`
       const fromUid = data?.fromUid;
       if (!fromUid) return;
 
-      // Resolve display name
+      // Resolve display name via getUserInfo (API returns key as "uid_0")
       let displayName = fromUid;
       try {
-        const info = await api.getUserInfo(fromUid) as {
-          userId?: string; zaloName?: string; display_name?: string;
-        } | undefined;
-        displayName = info?.display_name ?? info?.zaloName ?? fromUid;
+        const resp = await api.getUserInfo(fromUid) as {
+          changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
+          unchanged_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
+        };
+        const uidKey = fromUid.includes('_') ? fromUid : `${fromUid}_0`;
+        const profile =
+          resp?.changed_profiles?.[uidKey] ??
+          resp?.changed_profiles?.[fromUid] ??
+          resp?.unchanged_profiles?.[uidKey] ??
+          resp?.unchanged_profiles?.[fromUid];
+        displayName = profile?.displayName?.trim() || profile?.zaloName?.trim() || fromUid;
       } catch { /* use uid as fallback */ }
 
       const msgText = data?.message?.trim();
