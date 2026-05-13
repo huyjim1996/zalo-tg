@@ -12,6 +12,8 @@ credentials.json
 # Dữ liệu runtime
 data/topics.json
 data/*.json
+data/*.json.gz
+data/bot-api/
 tmp/
 
 # Logs
