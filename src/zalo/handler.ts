@@ -828,13 +828,8 @@ ${escapeHtml(photoCaption)}`
         if (media.action === 'recommened.misscall') {
           let params: { duration?: number; isCaller?: number; calltype?: number } = {};
           try { params = JSON.parse(media.params ?? '{}'); } catch { /* ignore */ }
-          const callTypeLabel = params.calltype === 1 ? '📹 cuộc gọi video' : '📞 cuộc gọi thoại';
-          const direction = params.isCaller === 1 ? 'Bạn đã gọi (không có trả lời)' : 'Cuộc gọi nhỡ từ';
-          const callText = `${groupCaption(senderName)}${direction} <b>${escapeHtml(senderName)}</b> — ${callTypeLabel} nhỡ`;
-          const sent = await tg.sendMessage(config.telegram.groupId, callText, {
-            ...tgBase,
-            parse_mode: 'HTML',
-          });
+          const callText = params.calltype === 1 ? '📹 cuộc gọi video nhỡ' : '📞 cuộc gọi thoại nhỡ';
+          const sent = await tg.sendMessage(config.telegram.groupId, callText, tgBase);
           saveTgMapping(sent);
           return;
         }
