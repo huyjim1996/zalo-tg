@@ -1,17 +1,102 @@
 import { ThreadType } from 'zca-js';
 import path from 'path';
 import { createReadStream } from 'fs';
+import { readFile, stat } from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+const execFileAsync = promisify(execFile);
 
 import type { ZaloAPI } from '../zalo/types.js';
 import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, aliasCache } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
-import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail, convertWebmToGif, convertTgsToGif } from '../utils/media.js';
+import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail, convertWebmToGif } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
 import { escapeHtml } from '../utils/format.js';
 
 // Bridge start time (module load = process start)
 const _bridgeStartTime = Date.now();
+
+/** Lấy trạng thái chi tiết của local Bot API server */
+async function getLocalApiStatus(serverUrl: string): Promise<string> {
+  const lines: string[] = [];
+
+  // 1. Ping HTTP
+  let httpOk = false;
+  let httpMs = -1;
+  try {
+    const t0 = Date.now();
+    const res = await (await import('axios')).default.get(`${serverUrl}/`, {
+      timeout: 4_000,
+      validateStatus: () => true,
+    });
+    httpMs = Date.now() - t0;
+    httpOk = res.status < 500;
+  } catch { /* ECONNREFUSED or timeout */ }
+
+  if (httpOk) {
+    lines.push(`🟢 HTTP: <b>online</b> (${httpMs} ms)`);
+  } else {
+    lines.push(`🔴 HTTP: <b>offline / ECONNREFUSED</b>`);
+  }
+
+  // 2. Process info via pgrep
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-a', 'telegram-bot-api']);
+    const pid = stdout.trim().split(/\s+/)[0];
+    if (pid) {
+      lines.push(`⚙️ PID: <code>${pid}</code>`);
+      // Memory (macOS: ps -o rss=)
+      try {
+        const { stdout: mem } = await execFileAsync('ps', ['-p', pid, '-o', 'rss=']);
+        const kb = parseInt(mem.trim(), 10);
+        if (!isNaN(kb)) lines.push(`💾 RAM: <code>${(kb / 1024).toFixed(1)} MB</code>`);
+      } catch { /* ignore */ }
+    } else {
+      lines.push(`⚙️ Process: <b>không tìm thấy</b>`);
+    }
+  } catch {
+    lines.push(`⚙️ Process: <b>không tìm thấy</b>`);
+  }
+
+  // 3. Log file — tail 3 dòng cuối
+  const logPath = path.join(
+    process.env.DATA_DIR
+      ? (path.isAbsolute(process.env.DATA_DIR) ? process.env.DATA_DIR : path.resolve(process.cwd(), process.env.DATA_DIR))
+      : path.resolve(process.cwd(), 'data'),
+    'bot-api', 'bot-api.log',
+  );
+  try {
+    const logStat = await stat(logPath);
+    const sizeMb = (logStat.size / 1024 / 1024).toFixed(2);
+    // Đọc 4 KB cuối để lấy tail
+    const buf = Buffer.alloc(Math.min(4096, logStat.size));
+    const fh  = await import('fs/promises').then(m => m.open(logPath, 'r'));
+    await fh.read(buf, 0, buf.length, Math.max(0, logStat.size - buf.length));
+    await fh.close();
+    const tail = buf.toString('utf8').trim().split('\n').slice(-3).join('\n');
+    const lastLine = tail.split('\n').pop() ?? '';
+    const hasError = /error|crash|fatal|signal 6|no space/i.test(lastLine);
+    lines.push(`📄 Log: <code>${sizeMb} MB</code> — dòng cuối:`);
+    lines.push(`<pre>${escapeHtml(lastLine.slice(0, 200))}</pre>`);
+    if (hasError) lines.push(`⚠️ Phát hiện lỗi trong log!`);
+  } catch {
+    lines.push(`📄 Log: <i>không đọc được</i>`);
+  }
+
+  // 4. Disk space gốc
+  try {
+    const { stdout } = await execFileAsync('df', ['-h', '/']);
+    const row = stdout.trim().split('\n')[1] ?? '';
+    const cols = row.trim().split(/\s+/);
+    // macOS df: Filesystem Size Used Avail Capacity ...
+    if (cols.length >= 5) {
+      lines.push(`💿 Disk /: ${cols[1]} total, ${cols[2]} used, ${cols[3]} avail (<b>${cols[4]}</b>)`);
+    }
+  } catch { /* ignore */ }
+
+  return lines.join('\n');
+}
 
 
 // ── Mention resolution helper ──────────────────────────────────────────────
@@ -854,11 +939,19 @@ export function setupTelegramHandler(
         accountLine = '\n👤 Zalo: đã kết nối 🟢';
       }
     }
+    let localApiSection = '';
+    if (config.telegram.localServer) {
+      const apiDetail = await getLocalApiStatus(config.telegram.localServer).catch(() => '❓ Không kiểm tra được');
+      localApiSection = `\n\n🤖 <b>Local Bot API</b> (<code>${config.telegram.localServer}</code>)\n${apiDetail}`;
+    } else {
+      localApiSection = `\n\n🌐 <b>Bot API</b>: official <code>api.telegram.org</code> (50 MB limit)`;
+    }
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
       `📊 <b>Trạng thái Bridge</b>${accountLine}\n` +
       `⏱ Uptime: <code>${uptimeStr}</code>\n` +
-      `📌 Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)`,
+      `📌 Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)` +
+      localApiSection,
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });
@@ -1699,31 +1792,13 @@ export function setupTelegramHandler(
             if (webmPath) await cleanTemp(webmPath);
             if (gifPath)  await cleanTemp(gifPath);
           }
-        } else if (sticker.is_animated) {
-          // Animated sticker (.tgs / Lottie+gzip) → convert to GIF via Python lottie
-          let tgsPath: string | null = null;
-          let gifPath: string | null = null;
-          try {
-            const fileLink = await ctx.telegram.getFileLink(sticker.file_id);
-            tgsPath = await downloadToTemp(fileLink.toString(), `sticker_${Date.now()}.tgs`);
-            gifPath = await convertTgsToGif(tgsPath);
-            sentMsgStore.markSending(zaloId);
-            try {
-              await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
-            } finally {
-              sentMsgStore.unmarkSending(zaloId);
-            }
-          } catch (err) {
-            console.error('[TG→Zalo] sticker tgs→gif failed, falling back to thumbnail:', err);
-            const thumbId = sticker.thumbnail?.file_id;
-            if (thumbId) await sendAttachment(thumbId, `sticker_${Date.now()}.jpg`);
-          } finally {
-            if (tgsPath) await cleanTemp(tgsPath);
-            if (gifPath)  await cleanTemp(gifPath);
-          }
         } else {
+          // Animated sticker (.tgs/Lottie) → no lightweight converter, use jpg thumbnail
           // Static sticker (.webp) → send as-is
-          await sendAttachment(sticker.file_id, `sticker_${Date.now()}.webp`);
+          const useThumb = sticker.is_animated && sticker.thumbnail;
+          const fileId   = useThumb ? sticker.thumbnail!.file_id : sticker.file_id;
+          const ext      = useThumb ? '.jpg' : '.webp';
+          await sendAttachment(fileId, `sticker_${Date.now()}${ext}`);
         }
         return;
       }
